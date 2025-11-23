@@ -1,19 +1,28 @@
--- TACS CORE CRYPTO LIBRARY 
+-- TACS CORE CRYPTO LIBRARY v3.1 (API COMPATIBLE)
 -- Algorithms: SHA-256, HMAC-SHA256, AES-128-CTR, CSPRNG-Lite
--- optimized for ComputerCraft (Lua 5.1)
 
-local bit = bit or require("bit")
-local rshift, lshift, band, bor, bxor, bnot = bit.brshift, bit.blshift, bit.band, bit.bor, bit.bxor, bit.bnot
+-- Handle 'bit' library for different CC versions
+local bit_lib = bit
+if not bit_lib and type(require) == "function" then
+    pcall(function() bit_lib = require("bit") end)
+end
+if not bit_lib then error("Bitwise library not found!") end
+
+local rshift, lshift, band, bor, bxor, bnot = bit_lib.brshift, bit_lib.blshift, bit_lib.band, bit_lib.bor, bit_lib.bxor, bit_lib.bnot
+
+-- Try to load BigInt (Optional)
+local hasBigInt = fs.exists("libs/bigint.lua")
+if hasBigInt then os.loadAPI("libs/bigint.lua") end
 
 -- ==========================================
 -- 1. UTILITIES
 -- ==========================================
 
-local function toHex(str)
+function toHex(str)
     return (str:gsub(".", function(c) return string.format("%02x", string.byte(c)) end))
 end
 
-local function fromHex(str)
+function fromHex(str)
     return (str:gsub("..", function(cc) return string.char(tonumber(cc, 16)) end))
 end
 
@@ -30,7 +39,7 @@ local function tableToStr(t)
 end
 
 -- ==========================================
--- 2. SHA-256 IMPLEMENTATION (FIPS 180-4)
+-- 2. SHA-256 IMPLEMENTATION
 -- ==========================================
 
 local K = {
@@ -46,7 +55,7 @@ local K = {
 
 local function rrotate(x, n) return bor(rshift(x, n), lshift(x, 32 - n)) end
 
-local function sha256(msg)
+function sha256(msg)
     local H = {
         0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
         0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
@@ -59,7 +68,6 @@ local function sha256(msg)
     local high = math.floor(msgBits / 4294967296)
     local low = msgBits % 4294967296
     
-    -- Big Endian Length Append
     for i = 1, 4 do msg = msg .. string.char(math.floor(high / 2^((4-i)*8)) % 256) end
     for i = 1, 4 do msg = msg .. string.char(math.floor(low / 2^((4-i)*8)) % 256) end
     
@@ -102,10 +110,10 @@ local function sha256(msg)
 end
 
 -- ==========================================
--- 3. HMAC-SHA256 (RFC 2104)
+-- 3. HMAC-SHA256
 -- ==========================================
 
-local function hmac(key, msg)
+function hmac(key, msg)
     local blockSize = 64
     if #key > blockSize then key = fromHex(sha256(key)) end
     if #key < blockSize then key = key .. string.rep(string.char(0), blockSize - #key) end
@@ -187,12 +195,10 @@ end
 local function keyExpansion(key)
     local k = strToTable(key)
     if #k ~= 16 then 
-        -- Fallback: If key is not 16 bytes, hash it and take first 16
         local h = sha256(key)
         local raw = fromHex(h)
         k = strToTable(string.sub(raw, 1, 16))
     end
-    
     for i = 16, 175 do
         local temp = {k[i-3], k[i-2], k[i-1], k[i]}
         if i % 16 == 0 then
@@ -221,14 +227,9 @@ local function aesEncryptBlock(input, expKey)
     return state
 end
 
--- AES-CTR Mode
--- Key: string (hashed to 128-bit)
--- Nonce: number/string
--- Text: string
-local function aes_ctr(key, nonce, text)
+function encrypt(key, nonce, text) -- EXPOSED FUNCTION (Renamed for clarity)
     local expKey = keyExpansion(key)
     local nonceStr = tostring(nonce)
-    -- Pad nonce to 8 bytes, add 8 byte counter
     while #nonceStr < 8 do nonceStr = "0" .. nonceStr end
     nonceStr = string.sub(nonceStr, 1, 8)
     
@@ -242,9 +243,7 @@ local function aes_ctr(key, nonce, text)
         for j=1, 8 do
             counterBlock[8+j] = tonumber(string.sub(cStr, (j-1)*2+1, j*2), 16)
         end
-        
         local keystream = aesEncryptBlock(counterBlock, expKey)
-        
         for j = 0, 15 do
             if i+j <= #textBytes then
                 table.insert(output, bxor(textBytes[i+j], keystream[j+1]))
@@ -254,64 +253,35 @@ local function aes_ctr(key, nonce, text)
     end
     return tableToStr(output)
 end
+decrypt = encrypt -- AES-CTR is symmetric
 
 -- ==========================================
--- 5. ENTROPY MIXER (CSPRNG-Lite)
+-- 5. ENTROPY MIXER
 -- ==========================================
 
 local entropy_pool = ""
-
 local function mix_entropy(data)
     entropy_pool = sha256(entropy_pool .. tostring(data))
 end
 
--- Initial Seeding
-mix_entropy(os.epoch("utc"))
+mix_entropy(os.epoch and os.epoch("utc") or os.time())
 mix_entropy(os.getComputerID())
 mix_entropy(math.random())
 
-local function secure_random()
-    -- Mix in current state
+function random()
     mix_entropy(os.clock())
-    
-    -- Extract integer from hash
     local h = entropy_pool
-    local sub = string.sub(h, 1, 8) -- Take 8 hex chars (32 bits)
+    local sub = string.sub(h, 1, 8)
     local num = tonumber(sub, 16)
-    
-    -- Cycle pool for next time
     mix_entropy(num)
-    
-    return num -- returns 0 to 4294967295
+    return num
 end
 
-local function random_bytes(n)
+function randomBytes(n)
     local res = ""
     for i=1, n do
-        local r = secure_random() % 256
+        local r = random() % 256
         res = res .. string.char(r)
     end
     return res
 end
-
--- ==========================================
--- 6. PUBLIC API
--- ==========================================
-
-return {
-    -- Hashing
-    sha256 = sha256,
-    hmac = hmac,
-    
-    -- Encryption
-    encrypt = aes_ctr,
-    decrypt = aes_ctr,
-    
-    -- Secure Randomness
-    random = secure_random,
-    randomBytes = random_bytes,
-    
-    -- Helpers
-    toHex = toHex,
-    fromHex = fromHex
-}
