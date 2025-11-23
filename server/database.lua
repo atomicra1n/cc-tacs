@@ -1,11 +1,35 @@
--- TACS DATABASE MANAGER v2.0 (HARDENED)
--- Tracks Node Health & Timestamps
+-- TACS DATABASE MANAGER v3.1 (STRICT NUMBERS)
+-- Enforces Number IDs to prevent String/Number duplicates
 
 os.loadAPI("libs/tacs_core.lua")
 
 local DB_FILE = "tacs_users.db"
 local NODES_FILE = "tacs_nodes.db"
 local KEY_FILE = ".cluster_key"
+
+-- === IN-MEMORY CACHE ===
+local MEMORY_NODES = {}
+
+local function initNodeCache()
+    -- Always track self
+    MEMORY_NODES[os.getComputerID()] = os.epoch and os.epoch("utc") or os.time()
+    
+    if fs.exists(NODES_FILE) then
+        local f = fs.open(NODES_FILE, "r")
+        local data = textutils.unserializeJSON(f.readAll())
+        f.close()
+        if data then
+            for k,v in pairs(data) do 
+                -- FORCE NUMBER ID
+                local numID = tonumber(k)
+                if numID then
+                    MEMORY_NODES[numID] = os.epoch and os.epoch("utc") or os.time()
+                end
+            end
+        end
+    end
+end
+initNodeCache()
 
 -- === USER MANAGEMENT ===
 function loadUsers()
@@ -22,71 +46,60 @@ function saveUsers(data)
     f.close()
 end
 
--- === CLUSTER NODE MANAGEMENT (ACTIVE HEALTH) ===
+-- === CLUSTER NODE MANAGEMENT ===
 
--- Loads table: { [id] = timestamp_last_seen }
 function loadNodes()
-    local nodes = {}
-    -- Always include ourselves with current time so we don't prune ourselves
-    nodes[os.getComputerID()] = os.epoch and os.epoch("utc") or os.time()
-    
-    if fs.exists(NODES_FILE) then
-        local f = fs.open(NODES_FILE, "r")
-        local data = textutils.unserializeJSON(f.readAll())
-        f.close()
-        -- Merge saved nodes
-        for k,v in pairs(data) do nodes[tonumber(k)] = v end
-    end
-    return nodes
+    return MEMORY_NODES
 end
 
--- Updates the "Last Seen" timestamp for a node
 function touchNode(id)
-    local nodes = loadNodes()
     local now = os.epoch and os.epoch("utc") or os.time()
+    local numID = tonumber(id) -- Ensure Number
     
-    nodes[id] = now
-    
-    local f = fs.open(NODES_FILE, "w")
-    f.write(textutils.serializeJSON(nodes))
-    f.close()
+    if not numID then return end -- Ignore weird inputs
+
+    if not MEMORY_NODES[numID] then
+        MEMORY_NODES[numID] = now
+        -- Persist to disk
+        local f = fs.open(NODES_FILE, "w")
+        f.write(textutils.serializeJSON(MEMORY_NODES))
+        f.close()
+    else
+        MEMORY_NODES[numID] = now
+    end
 end
 
--- Removes nodes we haven't heard from in 'timeout' milliseconds/seconds
 function pruneDeadNodes(timeout)
-    local nodes = loadNodes()
     local now = os.epoch and os.epoch("utc") or os.time()
-    local changed = false
-    local count = 0
+    local prunedCount = 0
+    local saveNeeded = false
+    local prunedIDs = ""
     
-    for id, lastSeen in pairs(nodes) do
-        -- Skip self
+    for id, lastSeen in pairs(MEMORY_NODES) do
         if id ~= os.getComputerID() then
             if (now - lastSeen) > timeout then
-                print("[DB] Pruning Dead Node: " .. id)
-                nodes[id] = nil
-                changed = true
-            else
-                count = count + 1
+                -- Log the specific ID being killed
+                prunedIDs = prunedIDs .. id .. " "
+                MEMORY_NODES[id] = nil
+                prunedCount = prunedCount + 1
+                saveNeeded = true
             end
-        else
-            count = count + 1
         end
     end
     
-    if changed then
+    if saveNeeded then
+        print("[DB] Pruning IDs: " .. prunedIDs) -- VISIBLE DEBUGGING
         local f = fs.open(NODES_FILE, "w")
-        f.write(textutils.serializeJSON(nodes))
+        f.write(textutils.serializeJSON(MEMORY_NODES))
         f.close()
     end
     
-    return count
+    return prunedCount
 end
 
 function getNodeCount()
-    local nodes = loadNodes()
     local count = 0
-    for _ in pairs(nodes) do count = count + 1 end
+    for _ in pairs(MEMORY_NODES) do count = count + 1 end
     return count
 end
 
@@ -103,13 +116,10 @@ end
 
 function genKey()
     if fs.exists(KEY_FILE) then return getKey() end
-    
     print("GENESIS: Generating new Cluster Key...")
     local key = tacs_core.randomBytes(32)
-    
     local f = fs.open(KEY_FILE, "w")
     f.write(key)
     f.close()
-    
     return key
 end
