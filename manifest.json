@@ -1,8 +1,7 @@
 {
-  "version": 4,
+  "version": 5,
   "common": [
-    "libs/tacs_core.lua",
-    "libs/network_utils.lua"
+    "libs/tacs_core.lua"
   ],
   "roles": {
     "server": [
