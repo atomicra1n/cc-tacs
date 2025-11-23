@@ -1,11 +1,9 @@
--- TACS DATABASE MANAGER
--- Handles JSON storage for Users and System Keys
+os.loadAPI("libs/tacs_core.lua")
 
 local DB_FILE = "tacs_users.db"
 local KEY_FILE = ".cluster_key"
-local core = require("libs/tacs_core") -- Crypto dependency
 
-local function loadUsers()
+function loadUsers()
     if not fs.exists(DB_FILE) then return {} end
     local f = fs.open(DB_FILE, "r")
     local data = textutils.unserializeJSON(f.readAll())
@@ -13,17 +11,13 @@ local function loadUsers()
     return data
 end
 
-local function saveUsers(data)
+function saveUsers(data)
     local f = fs.open(DB_FILE, "w")
     f.write(textutils.serializeJSON(data))
     f.close()
 end
 
--- === CLUSTER KEY MANAGEMENT ===
--- The Cluster Key allows servers to trust each other and the Minter.
--- It is generated once on the first server ("Genesis") and copied to others via disk.
-
-local function loadClusterKey()
+function getKey()
     if fs.exists(KEY_FILE) then
         local f = fs.open(KEY_FILE, "r")
         local k = f.readAll()
@@ -33,11 +27,11 @@ local function loadClusterKey()
     return nil
 end
 
-local function generateClusterKey()
-    if fs.exists(KEY_FILE) then return loadClusterKey() end
+function genKey()
+    if fs.exists(KEY_FILE) then return getKey() end
     
     print("GENESIS: Generating new Cluster Key...")
-    local key = core.randomBytes(32) -- 256-bit Key
+    local key = tacs_core.randomBytes(32)
     
     local f = fs.open(KEY_FILE, "w")
     f.write(key)
@@ -45,10 +39,3 @@ local function generateClusterKey()
     
     return key
 end
-
-return {
-    load = loadUsers,
-    save = saveUsers,
-    getKey = loadClusterKey,
-    genKey = generateClusterKey
-}
