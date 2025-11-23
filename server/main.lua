@@ -1,4 +1,4 @@
--- TACS SERVER NODE (HIVEMIND) v3.2
+-- TACS SERVER NODE (HIVEMIND) v3.3
 -- Role: Authentication Authority & Data Replication
 
 -- Use os.loadAPI for compatibility
@@ -16,17 +16,80 @@ term.setCursorPos(1,1)
 print("--- TACS HIVEMIND NODE ---")
 print("ID: " .. os.getComputerID())
 
+-- HELPER: Write Key to Disk
+local function writeKeyToDisk(key)
+    local drive = peripheral.find("drive")
+    if not drive then
+        print("[!] No Disk Drive found. Cannot create setup disk.")
+        return
+    end
+
+    print(">> Drive detected.")
+    
+    -- Wait for disk if missing
+    while not drive.isDiskPresent() do
+        term.setTextColor(colors.yellow)
+        print(">> Please insert a Floppy Disk to create a Setup Disk...")
+        term.setTextColor(colors.white)
+        os.pullEvent("disk")
+    end
+
+    local path = drive.getMountPath()
+    if path then
+        local f = fs.open(fs.combine(path, ".cluster_key"), "w")
+        f.write(key)
+        f.close()
+        term.setTextColor(colors.lime)
+        print("[OK] Cluster Key written to disk!")
+        print("    Take this disk to other servers to pair them.")
+        term.setTextColor(colors.white)
+    else
+        print("[!] Error mounting disk.")
+    end
+end
+
+-- === GENESIS LOGIC ===
 if not CLUSTER_KEY then
     print("[!] NO CLUSTER KEY FOUND")
     print("Is this the first server? (Genesis Node)")
     write("Generate Key? (y/n): ")
     local ans = read()
+    
     if ans == "y" then
         CLUSTER_KEY = database.genKey()
-        print("Key Generated. Copy '.cluster_key' to other nodes via Disk.")
+        print("Key Generated internally.")
+        writeKeyToDisk(CLUSTER_KEY)
     else
-        print("Please insert Disk with '.cluster_key' and reboot.")
-        while true do sleep(1) end
+        -- Follower Node Logic
+        local drive = peripheral.find("drive")
+        while not CLUSTER_KEY do
+             -- Check if key is already on disk
+             if drive and drive.isDiskPresent() then
+                local path = drive.getMountPath()
+                local keyPath = fs.combine(path, ".cluster_key")
+                if fs.exists(keyPath) then
+                    local f = fs.open(keyPath, "r")
+                    local k = f.readAll()
+                    f.close()
+                    
+                    -- Save to local system
+                    local localF = fs.open(".cluster_key", "w")
+                    localF.write(k)
+                    localF.close()
+                    CLUSTER_KEY = k
+                    term.setTextColor(colors.lime)
+                    print("[OK] Key loaded from disk! Rebooting...")
+                    term.setTextColor(colors.white)
+                    sleep(2)
+                    os.reboot()
+                end
+             end
+             
+             if not CLUSTER_KEY then
+                print("Please insert Disk with '.cluster_key'...")
+                os.pullEvent("disk")
+             end
+        end
     end
 else
     print("[+] Cluster Key Loaded.")
