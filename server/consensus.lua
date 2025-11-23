@@ -1,5 +1,5 @@
--- TACS CONSENSUS ENGINE (RAFT PROTOCOL) v4.1 (GOSSIP FIXED)
--- Fixes "Silent Follower" pruning bugs & File Mixup
+-- TACS CONSENSUS ENGINE (RAFT PROTOCOL) v4.3 (CLEAN)
+-- Fixed library structure error
 
 os.loadAPI("libs/tacs_core.lua")
 os.loadAPI("libs/network_utils.lua")
@@ -9,10 +9,10 @@ os.loadAPI("server/database.lua")
 local HEARTBEAT_INTERVAL = 2   
 local ELECTION_TIMEOUT_MIN = 4 
 local ELECTION_TIMEOUT_MAX = 7
-local PRUNE_INTERVAL = 10 
-local NODE_TIMEOUT = 15000 
+local PRUNE_INTERVAL = 15 
+local NODE_TIMEOUT = 30000 -- 30s timeout
 
-if not os.epoch then NODE_TIMEOUT = 15 end 
+if not os.epoch then NODE_TIMEOUT = 30 end 
 
 local CLUSTER_KEY = database.getKey()
 if not CLUSTER_KEY then error("Consensus failed: No Cluster Key loaded.") end
@@ -130,11 +130,10 @@ function handleRequestVote(senderID, msg)
     sendSecure(senderID, { type="VOTE_RESP", term=state.term, voteGranted=grant })
 end
 
--- [UPDATED] Heartbeat Handler: GOSSIP SYNC + REPLY
 function handleAppendEntries(senderID, msg)
     database.touchNode(senderID) -- Leader is alive
     
-    -- GOSSIP: Update our list of peers based on what the Leader sees
+    -- GOSSIP SYNC
     if msg.active_peers then
         for _, peerID in pairs(msg.active_peers) do
             if peerID ~= os.getComputerID() then
@@ -148,16 +147,12 @@ function handleAppendEntries(senderID, msg)
         state.role = "FOLLOWER"
         state.leaderID = senderID
         resetElectionTimer()
-        
-        -- REPLY TO LEADER so he knows we are alive
         sendSecure(senderID, { type="HEARTBEAT_RESP", term=state.term, success=true })
-        
     elseif msg.term < state.term then
         sendSecure(senderID, { type="HEARTBEAT_RESP", term=state.term, success=false })
     end
 end
 
--- [NEW] Heartbeat Response Handler
 function handleHeartbeatResponse(senderID, msg)
     database.touchNode(senderID)
 end
@@ -167,8 +162,6 @@ end
 local function runLeader()
     log("LEADER ACTIVE (Quorum: " .. getQuorum() .. ")")
     while state.role == "LEADER" do
-        
-        -- GOSSIP: Collect active nodes to share with followers
         local active_list = {}
         local nodes = database.loadNodes()
         for id, _ in pairs(nodes) do table.insert(active_list, id) end
@@ -177,7 +170,7 @@ local function runLeader()
             type = "APPEND_ENTRIES",
             term = state.term,
             leaderID = os.getComputerID(),
-            active_peers = active_list -- Tell followers who is alive
+            active_peers = active_list
         })
         sleep(HEARTBEAT_INTERVAL)
     end
@@ -243,7 +236,7 @@ local function pruneLoop()
         local pruned = database.pruneDeadNodes(NODE_TIMEOUT)
         if pruned > 0 then
             local q, t = getQuorum()
-            log("Pruned " .. pruned .. " dead nodes. New Total: " .. t .. " (Quorum: " .. q .. ")")
+            log("New Total: " .. t .. " (Quorum: " .. q .. ")")
         end
     end
 end
@@ -266,10 +259,8 @@ function start()
             while true do
                 local id, packet = network_utils.receive("CLUSTER", 9999)
                 if packet and packet.payload and packet.nonce then
-                    -- Decrypt
                     local plain = tacs_core.decrypt(CLUSTER_KEY, packet.nonce, packet.payload)
                     local status, msg = pcall(textutils.unserialize, plain)
-                    
                     if status and type(msg) == "table" and msg.type then
                         if msg.type == "REQUEST_VOTE" then handleRequestVote(id, msg)
                         elseif msg.type == "APPEND_ENTRIES" then handleAppendEntries(id, msg)
