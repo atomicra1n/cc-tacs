@@ -68,7 +68,6 @@ end
 -- Protocol: Encrypted with Cluster Key
 local function handleMint(id, msg)
     -- Attempt Decrypt
-    -- Msg is expected to be AES encrypted string
     local decrypted = tacs_core.decrypt(CLUSTER_KEY, msg.nonce, msg.payload)
     local req = textutils.unserialize(decrypted)
     
@@ -76,19 +75,38 @@ local function handleMint(id, msg)
     
     print("Minting Request: " .. req.username)
     
-    -- Generate New 256-bit Master Key for this user
+    -- Generate New 256-bit Master Key
     local newMasterKey = tacs_core.randomBytes(32)
     
-    -- Save to DB
-    users[req.username] = {
+    -- Update Local State
+    local userEntry = {
         masterKey = newMasterKey,
         level = req.level or 1,
         created = os.epoch("utc")
     }
+    users[req.username] = userEntry
     db.save(users)
     
-    -- Send the new key back to Minter (Encrypted)
-    -- Minter needs this to burn it onto the Fob
+    -- === REPLICATION (SYNC TO 30 SERVERS) ===
+    -- We broadcast this update to the cluster channel.
+    -- All other 29 servers will hear this and update their DBs.
+    local replPayload = textutils.serialize({
+        cmd = "REPLICATE_USER",
+        username = req.username,
+        data = userEntry
+    })
+    
+    -- Encrypt with Cluster Key so outsiders can't sniff the keys
+    local replNonce = os.epoch("utc")
+    local encryptedRepl = tacs_core.encrypt(CLUSTER_KEY, replNonce, replPayload)
+    
+    net.broadcast("CLUSTER", {
+        nonce = replNonce,
+        payload = encryptedRepl
+    })
+    print("Replication sent to swarm.")
+    
+    -- === REPLY TO MINTER ===
     local respPayload = textutils.serialize({
         success = true,
         masterKey = newMasterKey
@@ -101,6 +119,25 @@ local function handleMint(id, msg)
         nonce = respNonce,
         payload = encryptedResp
     })
+end
+
+-- 3. Handle Cluster Sync (From Other Servers)
+-- This keeps the 30 servers in sync
+local function handleClusterUpdate(id, msg)
+    -- Don't listen to ourselves
+    if id == os.getComputerID() then return end
+    
+    -- Decrypt packet
+    local decrypted = tacs_core.decrypt(CLUSTER_KEY, msg.nonce, msg.payload)
+    local update = textutils.unserialize(decrypted)
+    
+    if not update then return end
+    
+    if update.cmd == "REPLICATE_USER" then
+        print("Syncing User: " .. update.username .. " (From Node " .. id .. ")")
+        users[update.username] = update.data
+        db.save(users)
+    end
 end
 
 -- === MAIN LOOPS ===
@@ -119,6 +156,13 @@ local function minterListener()
     end
 end
 
+local function clusterListener()
+    while true do
+        local id, msg = net.receive("CLUSTER", 9999)
+        if msg then handleClusterUpdate(id, msg) end
+    end
+end
+
 -- Start services
-print("[*] Systems Online. Waiting for requests...")
-parallel.waitForAll(publicListener, minterListener)
+print("[*] Hivemind Online (" .. os.getComputerID() .. "). Waiting for requests...")
+parallel.waitForAll(publicListener, minterListener, clusterListener)
