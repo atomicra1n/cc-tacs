@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "common": [
+    "libs/tacs_core.lua",
+    "libs/network_utils.lua"
+  ],
+  "roles": {
+    "server": [
+      "server/main.lua",
+      "server/database.lua",
+      "server/consensus.lua"
+    ],
+    "turnstile": [
+      "turnstile/main.lua",
+      "turnstile/ui.lua"
+    ],
+    "minter": [
+      "minter/main.lua"
+    ]
+  },
+  "entrypoints": {
+    "server": "server/main.lua",
+    "turnstile": "turnstile/main.lua",
+    "minter": "minter/main.lua"
+  }
+}
