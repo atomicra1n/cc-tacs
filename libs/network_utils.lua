@@ -1,3 +1,6 @@
+-- TACS NETWORK UTILITIES v1.2
+-- FIXED: Modem Side Detection
+
 PROTOCOLS = {
     CLUSTER = "TACS_CLUSTER_V1",
     PUBLIC  = "TACS_PUBLIC_V1",
@@ -5,14 +8,25 @@ PROTOCOLS = {
 }
 
 function openModem()
-    local modem = peripheral.find("modem")
-    if not modem then
-        error("No Modem Found! Please attach a Wireless Modem.")
+    -- If already open, just find which one it is to return the object (optional but good for consistency)
+    for _, side in ipairs(peripheral.getNames()) do
+        if rednet.isOpen(side) then
+            return peripheral.wrap(side)
+        end
     end
-    if not rednet.isOpen(modem.name) then
-        rednet.open(modem.name)
+
+    -- If not open, search for a wireless modem
+    for _, side in ipairs(peripheral.getNames()) do
+        if peripheral.getType(side) == "modem" then
+            local modem = peripheral.wrap(side)
+            if modem.isWireless() then
+                rednet.open(side)
+                return modem
+            end
+        end
     end
-    return modem
+    
+    error("No Wireless Modem Found! Please attach one.")
 end
 
 function broadcast(protocolKey, msg)
