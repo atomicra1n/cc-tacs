@@ -16,6 +16,6 @@ while true do
         print(" mint <user> - Create a new card")
         print(" help        - Show this menu")
     elseif input ~= "" then
-        print("Unknown command: " .. input)
+        print("I do not know the command: " .. input)
     end
 end
