@@ -1,249 +1,291 @@
--- TACS SERVER NODE (HIVEMIND) v4.1 (FULL RELEASE)
--- Role: Authentication Authority, Consensus & Replication
+-- TACS CONSENSUS ENGINE (RAFT PROTOCOL) v4.1 (GOSSIP FIXED)
+-- Fixes "Silent Follower" pruning bugs & File Mixup
 
 os.loadAPI("libs/tacs_core.lua")
 os.loadAPI("libs/network_utils.lua")
 os.loadAPI("server/database.lua")
-os.loadAPI("server/consensus.lua")
+
+-- === CONFIGURATION ===
+local HEARTBEAT_INTERVAL = 2   
+local ELECTION_TIMEOUT_MIN = 4 
+local ELECTION_TIMEOUT_MAX = 7
+local PRUNE_INTERVAL = 10 
+local NODE_TIMEOUT = 15000 
+
+if not os.epoch then NODE_TIMEOUT = 15 end 
+
+local CLUSTER_KEY = database.getKey()
+if not CLUSTER_KEY then error("Consensus failed: No Cluster Key loaded.") end
 
 -- === STATE ===
-local users = database.loadUsers()
-local CLUSTER_KEY = database.getKey()
+local state = {
+    term = 0,           
+    role = "FOLLOWER",  
+    votedFor = nil,     
+    leaderID = nil,     
+    lastHeartbeat = os.clock()
+}
 
--- === INITIALIZATION & GENESIS ===
-term.clear()
-term.setCursorPos(1,1)
-print("--- TACS HIVEMIND NODE ---")
-print("ID: " .. os.getComputerID())
+local function saveState()
+    local f = fs.open(".raft_state", "w")
+    f.write(textutils.serialize({term = state.term, votedFor = state.votedFor}))
+    f.close()
+end
 
--- Helper: Write Cluster Key to Disk for pairing other servers
-local function writeKeyToDisk(key)
-    local drive = peripheral.find("drive")
-    if not drive then
-        print("[!] No Disk Drive found. Cannot create setup disk.")
-        return
-    end
-
-    print(">> Drive detected.")
-    
-    -- Wait for disk if missing
-    while not drive.isDiskPresent() do
-        term.setTextColor(colors.yellow)
-        print(">> Please insert a Floppy Disk to create a Setup Disk...")
-        term.setTextColor(colors.white)
-        os.pullEvent("disk")
-    end
-
-    local path = drive.getMountPath()
-    if path then
-        local f = fs.open(fs.combine(path, ".cluster_key"), "w")
-        f.write(key)
+local function loadState()
+    if fs.exists(".raft_state") then
+        local f = fs.open(".raft_state", "r")
+        local data = textutils.unserialize(f.readAll())
         f.close()
-        term.setTextColor(colors.lime)
-        print("[OK] Cluster Key written to disk!")
-        print("    Take this disk to other servers to pair them.")
-        term.setTextColor(colors.white)
-    else
-        print("[!] Error mounting disk.")
+        state.term = data.term
+        state.votedFor = data.votedFor
     end
 end
+loadState()
 
--- Check for Cluster Key (Genesis Logic)
-if not CLUSTER_KEY then
-    print("[!] NO CLUSTER KEY FOUND")
-    print("Is this the first server? (Genesis Node)")
-    write("Generate Key? (y/n): ")
-    local ans = read()
-    
-    if ans == "y" then
-        CLUSTER_KEY = database.genKey()
-        print("Key Generated internally.")
-        writeKeyToDisk(CLUSTER_KEY)
-    else
-        -- Follower Node Logic: Wait for disk
-        local drive = peripheral.find("drive")
-        while not CLUSTER_KEY do
-             if drive and drive.isDiskPresent() then
-                local path = drive.getMountPath()
-                local keyPath = fs.combine(path, ".cluster_key")
-                if fs.exists(keyPath) then
-                    local f = fs.open(keyPath, "r")
-                    local k = f.readAll()
-                    f.close()
-                    
-                    -- Save to local system
-                    local localF = fs.open(".cluster_key", "w")
-                    localF.write(k)
-                    localF.close()
-                    CLUSTER_KEY = k
-                    term.setTextColor(colors.lime)
-                    print("[OK] Key loaded from disk! Rebooting...")
-                    term.setTextColor(colors.white)
-                    sleep(2)
-                    os.reboot()
-                end
-             end
-             
-             if not CLUSTER_KEY then
-                print("Please insert Disk with '.cluster_key'...")
-                os.pullEvent("disk")
-             end
-        end
-    end
-else
-    print("[+] Cluster Key Loaded.")
+-- === UTILITIES ===
+local function log(msg)
+    print(string.format("[%s|T%d] %s", state.role, state.term, msg))
 end
 
--- === LOGIC HANDLERS ===
-
--- 1. Handle Access (READ ONLY - Can be done by anyone)
-local function handleAuth(id, msg)
-    if not msg.user or not msg.sig then return end
-    local userData = users[msg.user]
-    
-    if not userData then
-        network_utils.send(id, "PUBLIC", { granted = false, reason = "UNKNOWN" })
-        return 
-    end
-    
-    -- Verify HMAC
-    local dataToSign = (msg.gate or "") .. tostring(msg.nonce)
-    local expectedSig = tacs_core.hmac(userData.masterKey, dataToSign)
-    
-    if expectedSig == msg.sig then
-        network_utils.send(id, "PUBLIC", { granted = true })
-        print("[AUTH] Allowed " .. msg.user)
-    else
-        network_utils.send(id, "PUBLIC", { granted = false })
-        print("[AUTH] Denied " .. msg.user)
-    end
+local function getQuorum()
+    local total = database.getNodeCount()
+    local quorum = math.floor(total / 2) + 1
+    return quorum, total
 end
 
--- 2. Handle Minting (WRITE - Leader Only)
-local function handleMint(id, msg)
-    -- RAFT CHECK: Am I the Leader?
-    if not consensus.isLeader() then
-        local leader = consensus.getLeader()
-        -- Redirect Minter to the correct Leader
-        network_utils.send(id, "MINT", { retry = true, leader = leader })
-        print("[MINT] Redirecting to Leader: " .. tostring(leader))
-        return
-    end
+local function resetElectionTimer()
+    state.lastHeartbeat = os.clock()
+    state.timeoutDuration = math.random(ELECTION_TIMEOUT_MIN * 10, ELECTION_TIMEOUT_MAX * 10) / 10
+end
+resetElectionTimer()
 
-    -- I AM THE LEADER - PROCEED
-    local decrypted = tacs_core.decrypt(CLUSTER_KEY, msg.nonce, msg.payload)
-    local req = textutils.unserialize(decrypted)
-    
-    if not req or req.cmd ~= "MINT_USER" then return end
-    
-    print("[LEADER] Minting User: " .. req.username)
-    
-    -- Generate Data
-    local newMasterKey = tacs_core.randomBytes(32)
-    local userEntry = {
-        masterKey = newMasterKey,
-        level = req.level or 1,
-        created = os.epoch and os.epoch("utc") or os.time()
-    }
-    
-    -- Update Local DB
-    users[req.username] = userEntry
-    database.saveUsers(users)
-    
-    -- REPLICATION: Broadcast update to Followers (The Swarm)
-    -- We use the Cluster Key directly here to secure the replication packet
-    local replPayload = textutils.serialize({
-        cmd = "REPLICATE_USER",
-        username = req.username,
-        data = userEntry
-    })
-    
-    local replNonce = os.epoch and os.epoch("utc") or os.time()
-    local encryptedRepl = tacs_core.encrypt(CLUSTER_KEY, replNonce, replPayload)
+-- === SECURE COMMS ===
+
+local function broadcastSecure(msgTable)
+    local nonce = os.epoch and os.epoch("utc") or os.time()
+    local payload = textutils.serialize(msgTable)
+    local encrypted = tacs_core.encrypt(CLUSTER_KEY, nonce, payload)
     
     network_utils.broadcast("CLUSTER", {
-        nonce = replNonce,
-        payload = encryptedRepl
-    })
-    print("[LEADER] Replication Sent.")
-    
-    -- Reply to Minter
-    local respPayload = textutils.serialize({
-        success = true,
-        masterKey = newMasterKey
-    })
-    local respNonce = os.epoch and os.epoch("utc") or os.time()
-    local encryptedResp = tacs_core.encrypt(CLUSTER_KEY, respNonce, respPayload)
-    
-    network_utils.send(id, "MINT", {
-        nonce = respNonce,
-        payload = encryptedResp
+        nonce = nonce,
+        payload = encrypted
     })
 end
 
--- 3. Handle Replication (Followers applying updates)
-local function handleClusterUpdate(id, msg)
-    -- Ignore our own broadcasts
-    if id == os.getComputerID() then return end
+local function sendSecure(targetID, msgTable)
+    local nonce = os.epoch and os.epoch("utc") or os.time()
+    local payload = textutils.serialize(msgTable)
+    local encrypted = tacs_core.encrypt(CLUSTER_KEY, nonce, payload)
     
-    -- Decrypt
-    local decrypted = tacs_core.decrypt(CLUSTER_KEY, msg.nonce, msg.payload)
-    local update = textutils.unserialize(decrypted)
+    network_utils.send(targetID, "CLUSTER", {
+        nonce = nonce,
+        payload = encrypted
+    })
+end
+
+-- === DISCOVERY PROTOCOL ===
+local function performDiscovery()
+    local myID = os.getComputerID()
+    print("Broadcasting Secure Discovery Beacon...")
+    broadcastSecure({ type="CLUSTER_JOIN", id=myID })
+end
+
+-- === RPC HANDLERS ===
+
+function handleJoin(senderID, msg)
+    database.touchNode(senderID)
+    log("Discovered Peer: " .. senderID)
+    sendSecure(senderID, { type="CLUSTER_WELCOME", id=os.getComputerID() })
+end
+
+function handleWelcome(senderID, msg)
+    database.touchNode(senderID)
+end
+
+function handleRequestVote(senderID, msg)
+    database.touchNode(senderID)
     
-    if not update then return end
+    local grant = false
+    if msg.term < state.term then
+        sendSecure(senderID, { type="VOTE_RESP", term=state.term, voteGranted=false })
+        return
+    end
+
+    if msg.term > state.term then
+        state.term = msg.term
+        state.role = "FOLLOWER"
+        state.votedFor = nil
+        saveState()
+    end
+
+    if (state.votedFor == nil or state.votedFor == senderID) then
+        state.votedFor = senderID
+        saveState()
+        grant = true
+        resetElectionTimer() 
+        log("Voted for Node " .. senderID)
+    end
+
+    sendSecure(senderID, { type="VOTE_RESP", term=state.term, voteGranted=grant })
+end
+
+-- [UPDATED] Heartbeat Handler: GOSSIP SYNC + REPLY
+function handleAppendEntries(senderID, msg)
+    database.touchNode(senderID) -- Leader is alive
     
-    -- Apply Replication
-    if update.cmd == "REPLICATE_USER" then
-        print("[SYNC] User Update: " .. update.username .. " (via " .. id .. ")")
-        users[update.username] = update.data
-        database.saveUsers(users)
+    -- GOSSIP: Update our list of peers based on what the Leader sees
+    if msg.active_peers then
+        for _, peerID in pairs(msg.active_peers) do
+            if peerID ~= os.getComputerID() then
+                database.touchNode(peerID)
+            end
+        end
+    end
+    
+    if msg.term >= state.term then
+        state.term = msg.term
+        state.role = "FOLLOWER"
+        state.leaderID = senderID
+        resetElectionTimer()
+        
+        -- REPLY TO LEADER so he knows we are alive
+        sendSecure(senderID, { type="HEARTBEAT_RESP", term=state.term, success=true })
+        
+    elseif msg.term < state.term then
+        sendSecure(senderID, { type="HEARTBEAT_RESP", term=state.term, success=false })
     end
 end
 
--- === MAIN LOOPS ===
+-- [NEW] Heartbeat Response Handler
+function handleHeartbeatResponse(senderID, msg)
+    database.touchNode(senderID)
+end
 
-local function publicListener()
-    while true do
-        local id, msg = network_utils.receive("PUBLIC", 9999)
-        if msg then handleAuth(id, msg) end
+-- === LOOPS ===
+
+local function runLeader()
+    log("LEADER ACTIVE (Quorum: " .. getQuorum() .. ")")
+    while state.role == "LEADER" do
+        
+        -- GOSSIP: Collect active nodes to share with followers
+        local active_list = {}
+        local nodes = database.loadNodes()
+        for id, _ in pairs(nodes) do table.insert(active_list, id) end
+        
+        broadcastSecure({
+            type = "APPEND_ENTRIES",
+            term = state.term,
+            leaderID = os.getComputerID(),
+            active_peers = active_list -- Tell followers who is alive
+        })
+        sleep(HEARTBEAT_INTERVAL)
     end
 end
 
-local function minterListener()
-    while true do
-        local id, msg = network_utils.receive("MINT", 9999)
-        if msg then handleMint(id, msg) end
-    end
-end
+local function runCandidate()
+    state.term = state.term + 1
+    state.votedFor = os.getComputerID() 
+    saveState()
+    
+    local myID = os.getComputerID()
+    local votes = 1
+    log("Starting Election for Term " .. state.term)
 
--- Listens for Replication packets (REPLICATE_USER)
--- Note: Consensus packets (HEARTBEAT/VOTE) are handled by consensus.start
-local function clusterListener()
-    while true do
-        local id, msg = network_utils.receive("CLUSTER", 9999)
-        if msg and msg.payload then
-            -- We just check if it's a replication packet inside
-            -- We have to decrypt to find out, but since consensus.lua also decrypts,
-            -- this is a trade-off for simplicity in parallel execution.
-            local plain = tacs_core.decrypt(CLUSTER_KEY, msg.nonce, msg.payload)
-            local packet = textutils.unserialize(plain)
-            
-            if packet and packet.cmd == "REPLICATE_USER" then
-                -- Re-package logically for the handler to keep code clean
-                handleClusterUpdate(id, msg)
+    broadcastSecure({
+        type = "REQUEST_VOTE",
+        term = state.term,
+        candidateID = myID
+    })
+
+    local timer = os.startTimer(state.timeoutDuration)
+    while state.role == "CANDIDATE" do
+        local e, p1, p2, p3 = os.pullEvent()
+        
+        if e == "timer" and p1 == timer then
+            log("Election Timed Out. Retrying...")
+            return 
+        end
+
+        if e == "modem_message" then
+            local msg = p3
+            if type(msg) == "table" and msg.type == "VOTE_RESP" and msg.term == state.term and msg.voteGranted then
+                votes = votes + 1
+                local quorum, total = getQuorum()
+                if votes >= quorum then
+                    log("Won Election! ("..votes.."/"..total..")")
+                    state.role = "LEADER"
+                    return
+                end
+            elseif type(msg) == "table" and msg.term > state.term then
+                state.term = msg.term
+                state.role = "FOLLOWER"
+                saveState()
+                return
             end
         end
     end
 end
 
--- Start Everything
-print("[*] Node Online. Starting Consensus Engine...")
-parallel.waitForAll(
-    -- 1. Raft Engine (Handles Heartbeats, Elections, Dead Node Pruning)
-    consensus.start,
+local function runFollower()
+    while state.role == "FOLLOWER" do
+        if (os.clock() - state.lastHeartbeat) > state.timeoutDuration then
+            log("Leader Timeout. Revolting.")
+            state.role = "CANDIDATE"
+        end
+        sleep(0.5)
+    end
+end
+
+local function pruneLoop()
+    while true do
+        sleep(PRUNE_INTERVAL)
+        local pruned = database.pruneDeadNodes(NODE_TIMEOUT)
+        if pruned > 0 then
+            local q, t = getQuorum()
+            log("Pruned " .. pruned .. " dead nodes. New Total: " .. t .. " (Quorum: " .. q .. ")")
+        end
+    end
+end
+
+-- === MAIN PROCESS ===
+function start()
+    performDiscovery()
     
-    -- 2. App Listeners
-    publicListener,
-    minterListener,
-    clusterListener
-)
+    parallel.waitForAny(
+        function()
+            while true do
+                if state.role == "FOLLOWER" then runFollower()
+                elseif state.role == "CANDIDATE" then runCandidate()
+                elseif state.role == "LEADER" then runLeader()
+                end
+            end
+        end,
+        pruneLoop, 
+        function()
+            while true do
+                local id, packet = network_utils.receive("CLUSTER", 9999)
+                if packet and packet.payload and packet.nonce then
+                    -- Decrypt
+                    local plain = tacs_core.decrypt(CLUSTER_KEY, packet.nonce, packet.payload)
+                    local status, msg = pcall(textutils.unserialize, plain)
+                    
+                    if status and type(msg) == "table" and msg.type then
+                        if msg.type == "REQUEST_VOTE" then handleRequestVote(id, msg)
+                        elseif msg.type == "APPEND_ENTRIES" then handleAppendEntries(id, msg)
+                        elseif msg.type == "CLUSTER_JOIN" then handleJoin(id, msg)
+                        elseif msg.type == "CLUSTER_WELCOME" then handleWelcome(id, msg)
+                        elseif msg.type == "HEARTBEAT_RESP" then handleHeartbeatResponse(id, msg)
+                        elseif msg.type == "VOTE_RESP" then
+                            os.queueEvent("modem_message", "top", 0, msg, 0) 
+                        end
+                    end
+                end
+            end
+        end
+    )
+end
+
+function getRole() return state.role end
+function getLeader() return state.leaderID end
+function isLeader() return state.role == "LEADER" end
