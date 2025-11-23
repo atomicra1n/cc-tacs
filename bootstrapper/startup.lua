@@ -1,4 +1,5 @@
 -- TACS AUTO-UPDATER & BOOTSTRAPPER
+-- Place this file as "startup.lua" on every machine.
 
 -- === CONFIGURATION ===
 -- Set the role for this specific machine here as per manifest
@@ -17,6 +18,13 @@ local BASE_URL = "https://raw.githubusercontent.com/" .. REPO_USER .. "/" .. REP
 local MANIFEST_FILE = ".tacs_manifest" -- Stores local version info
 
 -- UTILITIES
+local function ensureDir(path)
+    local dir = fs.getDir(path)
+    if dir ~= "" and not fs.exists(dir) then
+        fs.makeDir(dir)
+    end
+end
+
 local function download(url, path)
     print("Downloading: " .. path)
     local response = http.get(url)
@@ -28,6 +36,7 @@ local function download(url, path)
     local content = response.readAll()
     response.close()
     
+    ensureDir(path)
     local file = fs.open(path, "w")
     file.write(content)
     file.close()
@@ -78,8 +87,10 @@ local function performUpdate()
     print("Starting Update Process...")
 
     -- Download Common Libraries
-    for _, file in pairs(remoteManifest.common) do
-        download(BASE_URL .. file, file)
+    if remoteManifest.common then
+        for _, file in pairs(remoteManifest.common) do
+            download(BASE_URL .. file, file)
+        end
     end
 
     -- Download Role-Specific Files
@@ -94,7 +105,9 @@ local function performUpdate()
 
     -- Update Local Version Record
     localManifest.version = remoteManifest.version
-    localManifest.entry = remoteManifest.entrypoints[ROLE]
+    if remoteManifest.entrypoints then
+        localManifest.entry = remoteManifest.entrypoints[ROLE]
+    end
     saveManifest(localManifest)
     
     print("Update Complete. Rebooting...")
@@ -119,7 +132,7 @@ end
 
 local function updateLoop()
     while true do
-        performUpdate() -- Check immediately on boot
+        performUpdate() 
         sleep(UPDATE_INTERVAL)
     end
 end
