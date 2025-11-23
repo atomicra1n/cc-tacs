@@ -1,0 +1,1 @@
+print("main of minter")
