@@ -1,6 +1,7 @@
--- TACS MINTER TERMINAL v6.2 (NON-BLOCKING FIX)
--- Fixed: Removed blocking event loop causing hang on empty queue
--- Added: Verbose Debugging
+-- TACS MINTER TERMINAL v7.0 (CEZ UI)
+-- Role: Issue Secure Cards & Manage Zones
+-- Fixed: Template argument alignment bug
+-- Added: Custom ASCII Art UI for Pocket Computers
 
 os.loadAPI("libs/tacs_core.lua")
 os.loadAPI("libs/network_utils.lua")
@@ -8,49 +9,115 @@ os.loadAPI("libs/network_utils.lua")
 local CLUSTER_KEY_FILE = ".cluster_key"
 local CLUSTER_KEY = nil
 
--- === 1. FOB FIRMWARE TEMPLATE (UNCHANGED) ===
+-- ==========================================
+-- 1. FOB FIRMWARE TEMPLATE (CEZ EDITION)
+-- ==========================================
 local FOB_TEMPLATE = [[
+-- TACS SECURE FOB (ID: %d)
 os.pullEvent = os.pullEventRaw 
 local MY_ID = os.getComputerID()
 local USERNAME = "%s"
 local ENC_KEY = "%s" 
 local NONCE_IV = "%s" 
 local CARD_TYPE = "%s" 
-local BG_COLOR = colors.black
-local TXT_COLOR = colors.white
-if CARD_TYPE == "BLUE" then BG_COLOR = colors.blue
-elseif CARD_TYPE == "GREEN" then BG_COLOR = colors.green
-elseif CARD_TYPE == "WHITE" then BG_COLOR = colors.white; TXT_COLOR = colors.black end
+
+-- UI Config
+local ROLE_NAME = "NÁVŠTĚVNÍK"
+local BG_COLOR = colors.white
+local TXT_COLOR = colors.black
+
+if CARD_TYPE == "BLUE" then 
+    ROLE_NAME = "ZAMĚSTNANEC"
+    BG_COLOR = colors.blue
+    TXT_COLOR = colors.white
+elseif CARD_TYPE == "GREEN" then 
+    ROLE_NAME = "EXTERNISTA"
+    BG_COLOR = colors.green
+    TXT_COLOR = colors.white
+end
+
 if not fs.exists("libs/tacs_core.lua") then error("CRITICAL: Crypto Library Missing!") end
 os.loadAPI("libs/tacs_core.lua")
+
+-- Decrypt Key
 local hw_key = tacs_core.sha256(tostring(MY_ID)) 
 local MASTER_KEY = tacs_core.decrypt(hw_key, NONCE_IV, ENC_KEY)
+
 if not MASTER_KEY or #MASTER_KEY == 0 then
     term.setBackgroundColor(colors.red)
     term.setTextColor(colors.white)
     term.clear()
-    print("SECURITY FATAL: HARDWARE ID MISMATCH.")
+    term.setCursorPos(1,1)
+    print("CHYBA HARDWARE ID")
+    print("Klonovani detekovano.")
     error()
 end
+
 local modem = peripheral.find("modem")
-if not modem then print("Error: No Wireless Modem!"); return end
+if not modem then print("Chyba: Zadne radio!"); return end
 modem.open(666) 
-term.setBackgroundColor(BG_COLOR)
-term.setTextColor(TXT_COLOR)
-term.clear()
-term.setCursorPos(1,1)
-print("TEMELIN IK: " .. CARD_TYPE)
-print("User: " .. USERNAME)
-print("Status: ARMED")
+
+-- === GUI RENDERER ===
+local function drawUI(status)
+    term.setBackgroundColor(BG_COLOR)
+    term.setTextColor(TXT_COLOR)
+    term.clear()
+    
+    local w, h = term.getSize()
+    local function cPrint(y, text)
+        local x = math.floor((w - #text) / 2) + 1
+        term.setCursorPos(x, y)
+        term.write(text)
+    end
+
+    -- CEZ ASCII ART (Miniaturized for Pocket PC 26x20)
+    -- Original was too tall (9 lines), condensed to 6 lines
+    local logoY = 2
+    term.setCursorPos(2, logoY);   term.write("#################")
+    term.setCursorPos(2, logoY+1); term.write("#")
+    term.setCursorPos(2, logoY+2); term.write("#   #############")
+    term.setCursorPos(2, logoY+3); term.write("#   #")
+    term.setCursorPos(2, logoY+4); term.write("#   #   #########")
+    term.setCursorPos(2, logoY+5); term.write("#   #")
+    term.setCursorPos(2, logoY+6); term.write("#   #############")
+    term.setCursorPos(2, logoY+7); term.write("#")
+    term.setCursorPos(2, logoY+8); term.write("#################")
+
+    local y = 9
+    cPrint(y, USERNAME)
+    cPrint(y+1, "-----------------")
+    cPrint(y+2, "Číslo IK: " .. MY_ID)
+    cPrint(y+3, "-----------------")
+    cPrint(y+4, "JE Temelín")
+    cPrint(y+5, "-----------------")
+    
+    -- Role / Status
+    if status then
+        term.setTextColor(colors.red)
+        cPrint(y+8, status)
+    else
+        term.setTextColor(TXT_COLOR)
+        cPrint(y+8, ROLE_NAME)
+    end
+end
+
+drawUI()
+
 while true do
     local e, side, sChan, rChan, msg, dist = os.pullEvent("modem_message")
     if type(msg) == "table" and msg.protocol == "TACS_AUTH_REQ" and msg.nonce then
-        term.setCursorPos(1,5); term.clearLine(); print("Ping: " .. (msg.gate or "Unknown"))
+        -- Visual Feedback
+        drawUI("VERIFIKACE...")
+        
+        -- Calc & Send
         local data = (msg.gate or "") .. tostring(msg.nonce)
         local sig = tacs_core.hmac(MASTER_KEY, data)
         modem.transmit(rChan, 666, { protocol = "TACS_AUTH_RESP", user = USERNAME, sig = sig, nonce = msg.nonce })
+        
         sleep(0.5)
-        term.setCursorPos(1,5); term.clearLine(); print("Status: ARMED")
+        drawUI("PŘÍSTUP POVOLEN")
+        sleep(2)
+        drawUI() -- Reset
     end
 end
 ]]
@@ -91,7 +158,7 @@ end
 
 CLUSTER_KEY = loadClusterKey()
 
--- [FIXED] Robust Sender Logic without Blocking
+-- Robust Sender
 local function sendToLeader(payloadTable)
     if not CLUSTER_KEY then CLUSTER_KEY = loadClusterKey() end
     if not CLUSTER_KEY then 
@@ -105,27 +172,22 @@ local function sendToLeader(payloadTable)
     local nonce = os.epoch("utc")
     local encReq = tacs_core.encrypt(CLUSTER_KEY, nonce, textutils.serialize(payloadTable))
     
-    print("[DEBUG] Broadcasting Request...")
+    while os.pullEventRaw("modem_message") == "modem_message" do end 
+    
     network_utils.broadcast("MINT", { nonce = nonce, payload = encReq })
+    print("Contacting Hivemind...")
     
     local leaderID = nil
-    
-    -- Try to get a response (Success or Redirect)
-    print("[DEBUG] Listening for Swarm...")
     local attempts = 0
     while attempts < 8 do
         local sender, msg = network_utils.receive("MINT", 0.5)
         if msg then
-            -- CASE A: Redirection (We hit a Follower)
             if msg.retry and msg.leader then
                 leaderID = msg.leader
-                print("[DEBUG] Redirect received -> Node " .. leaderID)
+                print("Redirected to Leader: " .. leaderID)
                 break 
             end
-            
-            -- CASE B: Direct Success (We hit the Leader)
             if msg.payload then
-                print("[DEBUG] Direct Reply received from " .. sender)
                 local dec = tacs_core.decrypt(CLUSTER_KEY, msg.nonce, msg.payload)
                 return textutils.unserialize(dec)
             end
@@ -133,31 +195,20 @@ local function sendToLeader(payloadTable)
         attempts = attempts + 1
     end
     
-    -- 2. Directed Phase (If Redirected)
     if leaderID then
-        print("[DEBUG] Contacting Leader " .. leaderID .. "...")
-        
-        -- RE-GENERATE NONCE (Prevent Deduplication Reject)
+        print("Sending to Leader " .. leaderID .. "...")
         nonce = os.epoch("utc")
         encReq = tacs_core.encrypt(CLUSTER_KEY, nonce, textutils.serialize(payloadTable))
-        
-        -- Send directly to Leader
         network_utils.send(leaderID, "MINT", { nonce = nonce, payload = encReq })
         
-        -- Listen for reply specifically from Leader
         for i=1, 10 do
             local sender, msg = network_utils.receive("MINT", 0.5)
             if sender == leaderID and msg and msg.payload then
-                print("[DEBUG] Leader Replied.")
                 local dec = tacs_core.decrypt(CLUSTER_KEY, msg.nonce, msg.payload)
                 return textutils.unserialize(dec)
             end
         end
-        print("[ERROR] Leader " .. leaderID .. " did not reply.")
-    else
-        print("[ERROR] No response from cluster.")
     end
-    
     return nil
 end
 
@@ -176,6 +227,7 @@ local function actionMint()
     local t = read()
     local cType = "BLUE"
     if t == "2" then cType = "GREEN" elseif t == "3" then cType = "WHITE" end
+    
     local perms = {}
     if cType ~= "WHITE" then
         print("\nPerms (comma sep, e.g. NPP,CORE):")
@@ -183,8 +235,10 @@ local function actionMint()
         local input = read()
         for p in string.gmatch(input, "([^,]+)") do table.insert(perms, p) end
     end
+    
     print("\nInsert Blank Pocket Computer into Drive...")
     while not peripheral.find("drive").isDiskPresent() do sleep(0.5) end
+    
     print("\nType Target ID (from Pocket Computer):")
     write("ID: ")
     local tid = tonumber(read())
@@ -281,24 +335,13 @@ local function actionPair()
     sleep(2)
 end
 
--- ==========================================
--- 4. MAIN MENU
--- ==========================================
 while true do
     term.clear(); term.setCursorPos(1,1)
     term.setTextColor(colors.yellow)
     print("--- TEMELIN MANAGEMENT ---")
     term.setTextColor(colors.white)
-    
-    if not CLUSTER_KEY then
-        term.setTextColor(colors.red)
-        print("STATUS: UNPAIRED")
-    else
-        term.setTextColor(colors.lime)
-        print("STATUS: ONLINE")
-    end
+    if not CLUSTER_KEY then term.setTextColor(colors.red); print("STATUS: UNPAIRED") else term.setTextColor(colors.lime); print("STATUS: ONLINE") end
     term.setTextColor(colors.white)
-    
     print("\n1. Mint New IK")
     print("2. Add Zone")
     print("3. List Zones")
@@ -307,7 +350,6 @@ while true do
     print("6. Exit")
     write("\n> ")
     local sel = read()
-    
     if sel == "1" then actionMint()
     elseif sel == "2" then actionAddZone()
     elseif sel == "3" then actionListZones()
