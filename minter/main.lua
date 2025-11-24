@@ -1,7 +1,7 @@
--- TACS MINTER TERMINAL v7.2 (HEX SAFE)
+-- TACS MINTER TERMINAL v7.3 (NON-BLOCKING FIX)
 -- Role: Issue Secure Cards & Manage Zones
--- Fixed: Binary key corruption (added Hex encoding)
--- Fixed: Czech character encoding issues (switched to ASCII)
+-- Fixed: Removed blocking drain loop (Causing "Hang on Fetch")
+-- Preserved: CEZ UI & Hex Encoding
 
 os.loadAPI("libs/tacs_core.lua")
 os.loadAPI("libs/network_utils.lua")
@@ -10,7 +10,7 @@ local CLUSTER_KEY_FILE = ".cluster_key"
 local CLUSTER_KEY = nil
 
 -- ==========================================
--- 1. FOB FIRMWARE TEMPLATE (HEX SAFE)
+-- 1. FOB FIRMWARE TEMPLATE (HEX SAFE + CEZ)
 -- ==========================================
 local FOB_TEMPLATE = [[
 -- TACS SECURE FOB (ID: %d)
@@ -41,7 +41,7 @@ os.loadAPI("libs/tacs_core.lua")
 
 -- Decrypt Key (From Hex)
 local hw_key = tacs_core.sha256(tostring(MY_ID)) 
-local enc_bytes = tacs_core.fromHex(ENC_KEY_HEX) -- Decode Hex first
+local enc_bytes = tacs_core.fromHex(ENC_KEY_HEX) 
 local MASTER_KEY = tacs_core.decrypt(hw_key, NONCE_IV, enc_bytes)
 
 if not MASTER_KEY or #MASTER_KEY == 0 then
@@ -155,6 +155,7 @@ end
 
 CLUSTER_KEY = loadClusterKey()
 
+-- [FIXED] Robust Sender (Non-Blocking)
 local function sendToLeader(payloadTable)
     if not CLUSTER_KEY then CLUSTER_KEY = loadClusterKey() end
     if not CLUSTER_KEY then 
@@ -168,7 +169,9 @@ local function sendToLeader(payloadTable)
     local nonce = os.epoch("utc")
     local encReq = tacs_core.encrypt(CLUSTER_KEY, nonce, textutils.serialize(payloadTable))
     
-    while os.pullEventRaw("modem_message") == "modem_message" do end 
+    -- [FIX] Drain queue using 0 timeout (Non-blocking)
+    -- This instantly consumes old messages without waiting if empty
+    while network_utils.receive("MINT", 0) do end
     
     network_utils.broadcast("MINT", { nonce = nonce, payload = encReq })
     print("Contacting Hivemind...")
@@ -195,6 +198,10 @@ local function sendToLeader(payloadTable)
         print("Sending to Leader " .. leaderID .. "...")
         nonce = os.epoch("utc")
         encReq = tacs_core.encrypt(CLUSTER_KEY, nonce, textutils.serialize(payloadTable))
+        
+        -- Flush again before directed send
+        while network_utils.receive("MINT", 0) do end
+        
         network_utils.send(leaderID, "MINT", { nonce = nonce, payload = encReq })
         
         for i=1, 10 do
@@ -247,18 +254,15 @@ local function actionMint()
         local hwKey = tacs_core.sha256(tostring(tid))
         local encMaster = tacs_core.encrypt(hwKey, bindIV, resp.masterKey)
         
-        -- HEX ENCODE THE BINARY KEY
+        -- HEX ENCODE
         local encHex = tacs_core.toHex(encMaster)
         
         local path = peripheral.find("drive").getMountPath()
         local f = fs.open(fs.combine(path, "startup.lua"), "w")
-        -- Inject Hex Key, not raw bytes
         f.write(string.format(FOB_TEMPLATE, tid, username, encHex, tostring(bindIV), cType))
         f.close()
-        
         if not fs.exists(fs.combine(path, "libs")) then fs.makeDir(fs.combine(path, "libs")) end
         fs.copy("libs/tacs_core.lua", fs.combine(path, "libs/tacs_core.lua"))
-        
         print("SUCCESS. Ejecting...")
         while peripheral.find("drive").isDiskPresent() do sleep(0.5) end
     else
