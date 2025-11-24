@@ -73,15 +73,15 @@ local function drawUI(status)
 
     -- CEZ ASCII ART
     local logoY = 2
-    term.setCursorPos(2, logoY);   term.write("#################")
-    term.setCursorPos(2, logoY+1); term.write("#")
-    term.setCursorPos(2, logoY+2); term.write("#   #############")
-    term.setCursorPos(2, logoY+3); term.write("#   #")
-    term.setCursorPos(2, logoY+4); term.write("#   #   #########")
-    term.setCursorPos(2, logoY+5); term.write("#   #")
-    term.setCursorPos(2, logoY+6); term.write("#   #############")
-    term.setCursorPos(2, logoY+7); term.write("#")
-    term.setCursorPos(2, logoY+8); term.write("#################")
+    term.setCursorPos(2, logoY);   term.write("  #################")
+    term.setCursorPos(2, logoY+1); term.write("  #")
+    term.setCursorPos(2, logoY+2); term.write("  #   #############")
+    term.setCursorPos(2, logoY+3); term.write("  #   #")
+    term.setCursorPos(2, logoY+4); term.write("  #   #   #########")
+    term.setCursorPos(2, logoY+5); term.write("  #   #")
+    term.setCursorPos(2, logoY+6); term.write("  #   #############")
+    term.setCursorPos(2, logoY+7); term.write("  #")
+    term.setCursorPos(2, logoY+8); term.write("  #################")
 
     local y = 11
     cPrint(y, USERNAME)
