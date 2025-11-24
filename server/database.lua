@@ -1,5 +1,5 @@
--- TACS DATABASE MANAGER v7.0 (ENCRYPTED KEYS)
--- Features: Device-Bound Key Storage
+-- TACS DATABASE MANAGER v8.0 (STATE MACHINE)
+-- Features: Device-Bound Key Storage, State Machine Logic
 
 os.loadAPI("libs/tacs_core.lua")
 
@@ -28,6 +28,7 @@ local function init()
             end
         end
     end
+    -- Self-register
     MEMORY_NODES[os.getComputerID()] = os.epoch and os.epoch("utc") or os.time()
 
     if fs.exists(DB_FILE) then
@@ -53,91 +54,55 @@ local function save(file, data)
     f.close()
 end
 
--- === SNAPSHOT API ===
-function isEmpty()
-    local uCount = 0
-    for _ in pairs(USERS) do uCount = uCount + 1 end
-    return uCount == 0
-end
-
-function dumpState()
-    return { users = USERS, zones = ZONES }
-end
-
-function restoreState(dumpData)
-    if not dumpData then return false end
-    if dumpData.users then
-        USERS = dumpData.users
-        save(DB_FILE, USERS)
-    end
-    if dumpData.zones then
-        ZONES = dumpData.zones
-        save(ZONES_FILE, ZONES)
-    end
-    return true
-end
-
--- === USER API ===
+-- === READ API (Safe to call anytime) ===
 function getUser(username) return USERS[username] end
-function setUser(username, data)
-    USERS[username] = data
-    save(DB_FILE, USERS)
-end
 function getAllUsers() return USERS end
-
--- === ZONE API ===
 function getZone(id) return ZONES[id] end
-function setZone(id, name, parent)
-    ZONES[id] = { name=name, parent=parent }
-    save(ZONES_FILE, ZONES)
-end
-function deleteZone(id)
-    if ZONES[id] then
-        ZONES[id] = nil
-        save(ZONES_FILE, ZONES)
-    end
-end
 function getAllZones() return ZONES end
-function getParent(zoneID) 
-    if ZONES[zoneID] then return ZONES[zoneID].parent end
-    return nil
+
+function getNodeCount()
+    local count = 0
+    for _ in pairs(MEMORY_NODES) do count = count + 1 end
+    return count
 end
 
--- === TRACKING API ===
-function getLoc(user) 
-    if not TRACKING[user] then return nil end
-    return TRACKING[user].zone 
-end
-
-function updateLoc(user, zoneID)
-    if not TRACKING[user] then TRACKING[user] = {} end
-    TRACKING[user].zone = zoneID
-    save(TRACK_FILE, TRACKING)
-end
-
-function linkEscort(visitor, escort)
-    if not TRACKING[visitor] then TRACKING[visitor] = {} end
-    if not TRACKING[escort] then TRACKING[escort] = {} end
-    TRACKING[visitor].escortedBy = escort
-    if not TRACKING[escort].escorting then TRACKING[escort].escorting = {} end
-    TRACKING[escort].escorting[visitor] = true
-    save(TRACK_FILE, TRACKING)
-end
-
-function unlinkEscort(visitor, escort)
-    if TRACKING[visitor] then TRACKING[visitor].escortedBy = nil end
-    if TRACKING[escort] and TRACKING[escort].escorting then
-        TRACKING[escort].escorting[visitor] = nil
-    end
-    save(TRACK_FILE, TRACKING)
-end
-
-function getEscortStatus(user)
-    return TRACKING[user] or {}
-end
-
--- === NODE API ===
 function loadNodes() return MEMORY_NODES end
+
+-- === STATE MACHINE APPLICATION (CRITICAL) ===
+-- This is called ONLY by consensus.lua when a log entry is COMMITTED.
+function apply(command)
+    if not command or type(command) ~= "table" then return false end
+    
+    if command.cmd == "MINT_USER" then
+        USERS[command.username] = command.data
+        save(DB_FILE, USERS)
+        print("[DB] Applied: User " .. command.username)
+        return true
+        
+    elseif command.cmd == "ADD_ZONE" then
+        ZONES[command.id] = { name=command.name, parent=command.parent }
+        save(ZONES_FILE, ZONES)
+        print("[DB] Applied: Zone " .. command.name)
+        return true
+        
+    elseif command.cmd == "DELETE_ZONE" then
+        ZONES[command.id] = nil
+        save(ZONES_FILE, ZONES)
+        print("[DB] Applied: Delete Zone " .. command.id)
+        return true
+        
+    elseif command.cmd == "TRACK_UPDATE" then
+        if not TRACKING[command.user] then TRACKING[command.user] = {} end
+        TRACKING[command.user].zone = command.zone
+        -- Tracking is volatile, maybe don't save to disk constantly to save I/O
+        -- save(TRACK_FILE, TRACKING) 
+        return true
+    end
+    
+    return false
+end
+
+-- === NODE & TRACKING UTILS ===
 function touchNode(id)
     local now = os.epoch and os.epoch("utc") or os.time()
     local numID = tonumber(id)
@@ -149,6 +114,7 @@ function touchNode(id)
         MEMORY_NODES[numID] = now
     end
 end
+
 function pruneDeadNodes(timeout)
     local now = os.epoch and os.epoch("utc") or os.time()
     local prunedCount = 0
@@ -165,14 +131,8 @@ function pruneDeadNodes(timeout)
     if saveNeeded then save(NODES_FILE, MEMORY_NODES) end
     return prunedCount
 end
-function getNodeCount()
-    local count = 0
-    for _ in pairs(MEMORY_NODES) do count = count + 1 end
-    return count
-end
 
 -- === KEY API (ENCRYPTED) ===
-
 local function getDeviceKey()
     return tacs_core.sha256(tostring(os.getComputerID()))
 end
@@ -193,15 +153,12 @@ function getKey()
         local content = f.readAll()
         f.close()
         
-        -- Try to deserialize (New format)
         local data = textutils.unserialize(content)
         if type(data) == "table" and data.iv and data.key then
-            -- Decrypt
             local hwKey = getDeviceKey()
             return tacs_core.decrypt(hwKey, data.iv, data.key)
         else
-            -- Fallback for legacy plaintext (auto-migrate)
-            print("[DB] Migrating Key to Encrypted Format...")
+            -- Migration path
             saveKey(content)
             return content 
         end
@@ -211,7 +168,6 @@ end
 
 function genKey()
     if fs.exists(KEY_FILE) then return getKey() end
-    print("GENESIS: Generating new Cluster Key...")
     local key = tacs_core.randomBytes(32)
     saveKey(key)
     return key
