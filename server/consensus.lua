@@ -1,16 +1,14 @@
--- TACS CONSENSUS ENGINE (RAFT PROTOCOL) v4.3 (CLEAN)
--- Fixed library structure error
-
 os.loadAPI("libs/tacs_core.lua")
 os.loadAPI("libs/network_utils.lua")
 os.loadAPI("server/database.lua")
+os.loadAPI("server/integrity.lua")
 
 -- === CONFIGURATION ===
 local HEARTBEAT_INTERVAL = 2   
 local ELECTION_TIMEOUT_MIN = 4 
 local ELECTION_TIMEOUT_MAX = 7
 local PRUNE_INTERVAL = 15 
-local NODE_TIMEOUT = 30000 -- 30s timeout
+local NODE_TIMEOUT = 30000 
 
 if not os.epoch then NODE_TIMEOUT = 30 end 
 
@@ -103,8 +101,20 @@ function handleWelcome(senderID, msg)
     database.touchNode(senderID)
 end
 
+-- [UPDATED] Vote Handler with Integrity Check
 function handleRequestVote(senderID, msg)
     database.touchNode(senderID)
+    
+    -- 1. SECURITY CHECK: CODE HASH
+    -- We only vote for people running the EXACT same code as us.
+    local myHash = integrity.getHash()
+    if msg.codeHash ~= myHash then
+        log("SECURITY WARNING: Node " .. senderID .. " has modified code!")
+        log("My Hash: " .. string.sub(myHash, 1, 6) .. " | Theirs: " .. string.sub(msg.codeHash or "NIL", 1, 6))
+        -- Reject vote immediately
+        sendSecure(senderID, { type="VOTE_RESP", term=state.term, voteGranted=false, reason="INTEGRITY_FAIL" })
+        return
+    end
     
     local grant = false
     if msg.term < state.term then
@@ -131,9 +141,8 @@ function handleRequestVote(senderID, msg)
 end
 
 function handleAppendEntries(senderID, msg)
-    database.touchNode(senderID) -- Leader is alive
+    database.touchNode(senderID) 
     
-    -- GOSSIP SYNC
     if msg.active_peers then
         for _, peerID in pairs(msg.active_peers) do
             if peerID ~= os.getComputerID() then
@@ -185,10 +194,12 @@ local function runCandidate()
     local votes = 1
     log("Starting Election for Term " .. state.term)
 
+    -- [UPDATED] Include Code Hash in Vote Request
     broadcastSecure({
         type = "REQUEST_VOTE",
         term = state.term,
-        candidateID = myID
+        candidateID = myID,
+        codeHash = integrity.getHash() -- PROOF OF INTEGRITY
     })
 
     local timer = os.startTimer(state.timeoutDuration)
@@ -243,6 +254,9 @@ end
 
 -- === MAIN PROCESS ===
 function start()
+    -- Calculate Hash on Boot
+    integrity.getHash() 
+    
     performDiscovery()
     
     parallel.waitForAny(
