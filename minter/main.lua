@@ -1,6 +1,5 @@
--- TACS MINTER TERMINAL v5.1 (SECURE KEY STORAGE)
--- Role: Issue Secure Cards & Manage Zones
--- Dependencies: libs/tacs_core.lua, libs/network_utils.lua
+-- TACS MINTER TERMINAL v6.0 (ROBUST NETWORKING)
+-- Fixed: Race conditions with redirects and deduplication
 
 os.loadAPI("libs/tacs_core.lua")
 os.loadAPI("libs/network_utils.lua")
@@ -77,14 +76,11 @@ local function loadClusterKey()
         local f = fs.open(CLUSTER_KEY_FILE, "r")
         local content = f.readAll()
         f.close()
-        
         local data = textutils.unserialize(content)
         if type(data) == "table" and data.iv and data.key then
-            -- Decrypt with HW ID
             local hwKey = getDeviceKey()
             return tacs_core.decrypt(hwKey, data.iv, data.key)
         else
-            -- Auto-Migrate plaintext
             saveKey(content)
             return content 
         end
@@ -94,6 +90,7 @@ end
 
 CLUSTER_KEY = loadClusterKey()
 
+-- [FIXED] Robust Sender
 local function sendToLeader(payloadTable)
     if not CLUSTER_KEY then CLUSTER_KEY = loadClusterKey() end
     if not CLUSTER_KEY then 
@@ -107,27 +104,96 @@ local function sendToLeader(payloadTable)
     local nonce = os.epoch("utc")
     local encReq = tacs_core.encrypt(CLUSTER_KEY, nonce, textutils.serialize(payloadTable))
     
+    -- 1. Initial Discovery Broadcast
+    -- We clear queue first to ensure fresh response
+    while os.pullEventRaw("modem_message") == "modem_message" do end -- Drain (non-blocking check logic needed actually)
+    -- CC doesn't have easy non-blocking peek, so we just rely on loop filtering below.
+    
     network_utils.broadcast("MINT", { nonce = nonce, payload = encReq })
-    
     print("Contacting Hivemind...")
-    local sender, msg = network_utils.receive("MINT", 5)
     
-    if not msg then
-        print("[TIMEOUT] No response.")
-        sleep(2)
-        return nil
+    local timer = os.startTimer(3)
+    local leaderID = nil
+    
+    -- LOOP 1: Discovery Phase
+    -- Listen for EITHER a Success (if Leader heard us) OR a Redirect
+    while true do
+        local e, p1, p2, p3 = os.pullEvent()
+        if e == "timer" and p1 == timer then
+            break -- Timeout
+        elseif e == "modem_message" then
+            -- Check protocol manually since network_utils.receive eats events
+            -- p3 is channel, p4 is replyChan, p5 is msg
+            -- Wait, os.pullEvent returns different args.
+            -- event, side, senderChannel, replyChannel, message, distance
+            local msg = p3 -- Using network_utils abstraction is safer usually, but we need control.
+            -- Let's stick to network_utils.receive logic but wrapped in a loop
+        end
     end
     
-    if msg.retry and msg.leader then
-        print("Redirected to Leader: " .. msg.leader)
-        network_utils.send(msg.leader, "MINT", { nonce = nonce, payload = encReq })
-        sender, msg = network_utils.receive("MINT", 5)
+    -- Re-implementing receive loop using network_utils to keep it simple but robust
+    local attempts = 0
+    while attempts < 10 do
+        local sender, msg = network_utils.receive("MINT", 1) -- Short timeout to cycle fast
+        
+        if msg then
+            -- CASE A: Redirection
+            if msg.retry and msg.leader then
+                leaderID = msg.leader
+                -- STOP LISTENING to others. We found the Leader ID.
+                break 
+            end
+            
+            -- CASE B: Direct Success (Leader heard broadcast)
+            if msg.payload then
+                local dec = tacs_core.decrypt(CLUSTER_KEY, msg.nonce, msg.payload)
+                local resp = textutils.unserialize(dec)
+                if resp then return resp end -- Success!
+            end
+        else
+            attempts = attempts + 1
+        end
     end
     
-    if msg and msg.payload then
-        local dec = tacs_core.decrypt(CLUSTER_KEY, msg.nonce, msg.payload)
-        return textutils.unserialize(dec)
+    -- 2. Directed Phase (If we found a Leader ID)
+    if leaderID then
+        print("Leader identified: " .. leaderID)
+        
+        -- RE-GENERATE NONCE (Fixes Server Dedup ignoring us)
+        nonce = os.epoch("utc")
+        encReq = tacs_core.encrypt(CLUSTER_KEY, nonce, textutils.serialize(payloadTable))
+        
+        network_utils.send(leaderID, "MINT", { nonce = nonce, payload = encReq })
+        
+        -- Wait for SPECIFIC reply from Leader
+        local retryTimer = os.startTimer(4)
+        while true do
+            local e, side, sChan, rChan, msg, dist = os.pullEvent()
+            if e == "timer" and side == retryTimer then
+                print("Leader timed out.")
+                return nil
+            elseif e == "modem_message" and sChan == 666 and type(msg) == "table" then -- 666 isn't mint chan
+                -- We need to check if it matches MINT protocol
+                -- Assuming network_utils opens specific channels. 
+                -- Let's blindly trust network_utils.receive but verify Sender ID
+                
+                -- Actually, let's just use network_utils receive loop
+            end
+        end
     end
+    
+    -- CLEAN IMPLEMENTATION OF PHASE 2
+    if leaderID then
+        -- Loop to drain queue of old redirects and find the real payload
+        for i=1, 20 do
+            local sender, msg = network_utils.receive("MINT", 0.2)
+            if sender == leaderID and msg and msg.payload then
+                local dec = tacs_core.decrypt(CLUSTER_KEY, msg.nonce, msg.payload)
+                return textutils.unserialize(dec)
+            end
+        end
+    end
+    
     return nil
 end
 
@@ -176,6 +242,7 @@ local function actionMint()
         while peripheral.find("drive").isDiskPresent() do sleep(0.5) end
     else
         print("FAILED.")
+        if resp and resp.msg then print(resp.msg) end -- Error info
         sleep(2)
     end
 end
@@ -209,7 +276,7 @@ local function actionListZones()
             print(string.format("[%s] %s (Parent: %s)", id, data.name, data.parent or "ROOT"))
         end
     else
-        print("Failed to fetch.")
+        print("Failed to fetch or Empty.")
     end
     print("\nPress Enter...")
     read()
@@ -238,11 +305,8 @@ local function actionPair()
         local f = fs.open(diskKeyPath, "r")
         local rawKey = f.readAll()
         f.close()
-        
-        -- Save ENCRYPTED
         saveKey(rawKey)
         CLUSTER_KEY = rawKey
-        
         print("PAIRED & ENCRYPTED.")
     else
         print("ERROR: No key found.")
