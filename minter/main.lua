@@ -1,7 +1,7 @@
--- TACS MINTER TERMINAL v7.1 (CEZ FIX)
+-- TACS MINTER TERMINAL v7.2 (HEX SAFE)
 -- Role: Issue Secure Cards & Manage Zones
--- Fixed: Removed blocking event loop causing hang
--- Updated: UI Text to match Temelin spec
+-- Fixed: Binary key corruption (added Hex encoding)
+-- Fixed: Czech character encoding issues (switched to ASCII)
 
 os.loadAPI("libs/tacs_core.lua")
 os.loadAPI("libs/network_utils.lua")
@@ -10,24 +10,24 @@ local CLUSTER_KEY_FILE = ".cluster_key"
 local CLUSTER_KEY = nil
 
 -- ==========================================
--- 1. FOB FIRMWARE TEMPLATE (CEZ EDITION)
+-- 1. FOB FIRMWARE TEMPLATE (HEX SAFE)
 -- ==========================================
 local FOB_TEMPLATE = [[
 -- TACS SECURE FOB (ID: %d)
 os.pullEvent = os.pullEventRaw 
 local MY_ID = os.getComputerID()
 local USERNAME = "%s"
-local ENC_KEY = "%s" 
+local ENC_KEY_HEX = "%s" -- Hex Encoded
 local NONCE_IV = "%s" 
 local CARD_TYPE = "%s" 
 
 -- UI Config
-local ROLE_NAME = "NÁVŠTĚVNÍK"
+local ROLE_NAME = "NAVSTEVNIK"
 local BG_COLOR = colors.white
 local TXT_COLOR = colors.black
 
 if CARD_TYPE == "BLUE" then 
-    ROLE_NAME = "ZAMĚSTNANEC"
+    ROLE_NAME = "ZAMESTNANEC"
     BG_COLOR = colors.blue
     TXT_COLOR = colors.white
 elseif CARD_TYPE == "GREEN" then 
@@ -39,9 +39,10 @@ end
 if not fs.exists("libs/tacs_core.lua") then error("CRITICAL: Crypto Library Missing!") end
 os.loadAPI("libs/tacs_core.lua")
 
--- Decrypt Key
+-- Decrypt Key (From Hex)
 local hw_key = tacs_core.sha256(tostring(MY_ID)) 
-local MASTER_KEY = tacs_core.decrypt(hw_key, NONCE_IV, ENC_KEY)
+local enc_bytes = tacs_core.fromHex(ENC_KEY_HEX) -- Decode Hex first
+local MASTER_KEY = tacs_core.decrypt(hw_key, NONCE_IV, enc_bytes)
 
 if not MASTER_KEY or #MASTER_KEY == 0 then
     term.setBackgroundColor(colors.red)
@@ -70,7 +71,7 @@ local function drawUI(status)
         term.write(text)
     end
 
-    -- CEZ ASCII ART (Condensed)
+    -- CEZ ASCII ART
     local logoY = 2
     term.setCursorPos(2, logoY);   term.write("#################")
     term.setCursorPos(2, logoY+1); term.write("#")
@@ -87,7 +88,6 @@ local function drawUI(status)
     cPrint(y+1, "-----------------")
     cPrint(y+2, "IK: " .. MY_ID)
     cPrint(y+3, "-----------------")
-    -- Split long text to ensure fit on Pocket Computer
     cPrint(y+4, "Jaderna elektrarna")
     cPrint(y+5, "Temelin")
     cPrint(y+6, "-----------------")
@@ -107,18 +107,14 @@ drawUI()
 while true do
     local e, side, sChan, rChan, msg, dist = os.pullEvent("modem_message")
     if type(msg) == "table" and msg.protocol == "TACS_AUTH_REQ" and msg.nonce then
-        -- Visual Feedback
         drawUI("VERIFIKACE...")
-        
-        -- Calc & Send
         local data = (msg.gate or "") .. tostring(msg.nonce)
         local sig = tacs_core.hmac(MASTER_KEY, data)
         modem.transmit(rChan, 666, { protocol = "TACS_AUTH_RESP", user = USERNAME, sig = sig, nonce = msg.nonce })
-        
         sleep(0.5)
-        drawUI("PŘÍSTUP POVOLEN")
+        drawUI("PRISTUP POVOLEN")
         sleep(2)
-        drawUI() -- Reset
+        drawUI() 
     end
 end
 ]]
@@ -159,7 +155,6 @@ end
 
 CLUSTER_KEY = loadClusterKey()
 
--- [FIXED] Robust Sender (Non-Blocking)
 local function sendToLeader(payloadTable)
     if not CLUSTER_KEY then CLUSTER_KEY = loadClusterKey() end
     if not CLUSTER_KEY then 
@@ -173,7 +168,7 @@ local function sendToLeader(payloadTable)
     local nonce = os.epoch("utc")
     local encReq = tacs_core.encrypt(CLUSTER_KEY, nonce, textutils.serialize(payloadTable))
     
-    -- Removed blocking 'while os.pullEventRaw' loop here
+    while os.pullEventRaw("modem_message") == "modem_message" do end 
     
     network_utils.broadcast("MINT", { nonce = nonce, payload = encReq })
     print("Contacting Hivemind...")
@@ -251,12 +246,19 @@ local function actionMint()
         local bindIV = os.epoch("utc")
         local hwKey = tacs_core.sha256(tostring(tid))
         local encMaster = tacs_core.encrypt(hwKey, bindIV, resp.masterKey)
+        
+        -- HEX ENCODE THE BINARY KEY
+        local encHex = tacs_core.toHex(encMaster)
+        
         local path = peripheral.find("drive").getMountPath()
         local f = fs.open(fs.combine(path, "startup.lua"), "w")
-        f.write(string.format(FOB_TEMPLATE, tid, username, encMaster, tostring(bindIV), cType))
+        -- Inject Hex Key, not raw bytes
+        f.write(string.format(FOB_TEMPLATE, tid, username, encHex, tostring(bindIV), cType))
         f.close()
+        
         if not fs.exists(fs.combine(path, "libs")) then fs.makeDir(fs.combine(path, "libs")) end
         fs.copy("libs/tacs_core.lua", fs.combine(path, "libs/tacs_core.lua"))
+        
         print("SUCCESS. Ejecting...")
         while peripheral.find("drive").isDiskPresent() do sleep(0.5) end
     else
