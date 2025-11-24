@@ -1,7 +1,6 @@
--- TACS MINTER TERMINAL v7.3 (NON-BLOCKING FIX)
+-- TACS MINTER TERMINAL v8.0 (RAFT COMPATIBLE)
 -- Role: Issue Secure Cards & Manage Zones
--- Fixed: Removed blocking drain loop (Causing "Hang on Fetch")
--- Preserved: CEZ UI & Hex Encoding
+-- Update: Dynamic Nonce Regeneration for Replay Protection
 
 os.loadAPI("libs/tacs_core.lua")
 os.loadAPI("libs/network_utils.lua")
@@ -123,13 +122,18 @@ end
 -- 2. UTILITIES
 -- ==========================================
 
+-- Strict Time Sync Wrapper
+local function getTime()
+    return os.epoch and os.epoch("utc") or os.time()
+end
+
 local function getDeviceKey()
     return tacs_core.sha256(tostring(os.getComputerID()))
 end
 
 local function saveKey(rawKey)
     local hwKey = getDeviceKey()
-    local iv = os.epoch and os.epoch("utc") or os.time()
+    local iv = getTime()
     local encrypted = tacs_core.encrypt(hwKey, iv, rawKey)
     local f = fs.open(CLUSTER_KEY_FILE, "w")
     f.write(textutils.serialize({ iv = iv, key = encrypted }))
@@ -155,8 +159,7 @@ end
 
 CLUSTER_KEY = loadClusterKey()
 
--- [FIXED] Robust Sender (Non-Blocking)
-local function sendToLeader(payloadTable)
+local function sendToLeader(payloadTable, specificTarget)
     if not CLUSTER_KEY then CLUSTER_KEY = loadClusterKey() end
     if not CLUSTER_KEY then 
         term.setTextColor(colors.red)
@@ -166,52 +169,46 @@ local function sendToLeader(payloadTable)
         return nil 
     end
     
-    local nonce = os.epoch("utc")
-    local encReq = tacs_core.encrypt(CLUSTER_KEY, nonce, textutils.serialize(payloadTable))
-    
-    -- [FIX] Drain queue using 0 timeout (Non-blocking)
-    -- This instantly consumes old messages without waiting if empty
-    while network_utils.receive("MINT", 0) do end
-    
-    network_utils.broadcast("MINT", { nonce = nonce, payload = encReq })
-    print("Contacting Hivemind...")
-    
-    local leaderID = nil
     local attempts = 0
+    local target = specificTarget
+    
     while attempts < 8 do
-        local sender, msg = network_utils.receive("MINT", 0.5)
+        -- REGENERATION: We must regenerate Nonce & Encryption on every try
+        -- Otherwise, if we retry after 10s, the server rejects us.
+        local nonce = getTime()
+        local encReq = tacs_core.encrypt(CLUSTER_KEY, nonce, textutils.serialize(payloadTable))
+        
+        -- Flush old messages
+        while network_utils.receive("MINT", 0) do end
+        
+        if target then
+            print("Sending to Node " .. target .. "...")
+            network_utils.send(target, "MINT", { nonce = nonce, payload = encReq })
+        else
+            print("Broadcasting to Cluster...")
+            network_utils.broadcast("MINT", { nonce = nonce, payload = encReq })
+        end
+        
+        local sender, msg = network_utils.receive("MINT", 1.5) -- Wait longer for Raft Consensus
+        
         if msg then
             if msg.retry and msg.leader then
-                leaderID = msg.leader
-                print("Redirected to Leader: " .. leaderID)
-                break 
-            end
-            if msg.payload then
+                print("Redirected to Leader: " .. msg.leader)
+                target = msg.leader
+                -- Loop will retry immediately with new target AND FRESH NONCE
+            elseif msg.payload then
                 local dec = tacs_core.decrypt(CLUSTER_KEY, msg.nonce, msg.payload)
                 return textutils.unserialize(dec)
             end
+        else
+            -- Timeout handling
+            print("Timeout... Retrying")
+            target = nil -- Fallback to broadcast if specific target failed
         end
+        
         attempts = attempts + 1
     end
     
-    if leaderID then
-        print("Sending to Leader " .. leaderID .. "...")
-        nonce = os.epoch("utc")
-        encReq = tacs_core.encrypt(CLUSTER_KEY, nonce, textutils.serialize(payloadTable))
-        
-        -- Flush again before directed send
-        while network_utils.receive("MINT", 0) do end
-        
-        network_utils.send(leaderID, "MINT", { nonce = nonce, payload = encReq })
-        
-        for i=1, 10 do
-            local sender, msg = network_utils.receive("MINT", 0.5)
-            if sender == leaderID and msg and msg.payload then
-                local dec = tacs_core.decrypt(CLUSTER_KEY, msg.nonce, msg.payload)
-                return textutils.unserialize(dec)
-            end
-        end
-    end
     return nil
 end
 
@@ -247,10 +244,17 @@ local function actionMint()
     local tid = tonumber(read())
     if not tid then return end
     
-    local resp = sendToLeader({ cmd = "MINT_USER", username = username, level = 1, meta = { type = cType, perms = perms } })
+    print("Requesting Mint from Hivemind...")
+    local resp = sendToLeader({ 
+        cmd = "MINT_USER", 
+        username = username, 
+        level = 1, 
+        meta = { type = cType, perms = perms } 
+    })
+    
     if resp and resp.success then
         print("Burning...")
-        local bindIV = os.epoch("utc")
+        local bindIV = getTime()
         local hwKey = tacs_core.sha256(tostring(tid))
         local encMaster = tacs_core.encrypt(hwKey, bindIV, resp.masterKey)
         
