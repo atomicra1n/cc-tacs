@@ -1,20 +1,24 @@
--- TACS SERVER NODE (HIVEMIND) v4.1 (FULL RELEASE)
--- Role: Authentication Authority, Consensus & Replication
+-- TACS SERVER NODE (HIVEMIND) v6.1 (FULL MANAGEMENT)
+-- Features: Consensus, User Minting, Zone Management, Replication
+-- Includes: Full Genesis Setup Logic
 
 os.loadAPI("libs/tacs_core.lua")
 os.loadAPI("libs/network_utils.lua")
 os.loadAPI("server/database.lua")
 os.loadAPI("server/consensus.lua")
+-- integrity.lua is loaded inside consensus.lua
 
--- === STATE ===
-local users = database.loadUsers()
+local users = database.getAllUsers()
+local zones = database.getAllZones()
 local CLUSTER_KEY = database.getKey()
 
--- === INITIALIZATION & GENESIS ===
+-- === INITIALIZATION ===
 term.clear()
 term.setCursorPos(1,1)
-print("--- TACS HIVEMIND NODE ---")
+print("--- TACS TEMELIN NODE ---")
 print("ID: " .. os.getComputerID())
+
+-- === GENESIS HELPERS ===
 
 -- Helper: Write Cluster Key to Disk for pairing other servers
 local function writeKeyToDisk(key)
@@ -48,7 +52,7 @@ local function writeKeyToDisk(key)
     end
 end
 
--- Check for Cluster Key (Genesis Logic)
+-- === GENESIS LOGIC ===
 if not CLUSTER_KEY then
     print("[!] NO CLUSTER KEY FOUND")
     print("Is this the first server? (Genesis Node)")
@@ -94,156 +98,103 @@ else
     print("[+] Cluster Key Loaded.")
 end
 
--- === LOGIC HANDLERS ===
+-- === 1. REPLICATION HANDLER (Followers applying updates) ===
+local function handleReplication(id, packet)
+    if packet.cmd == "REPLICATE_USER" then
+        database.setUser(packet.username, packet.data)
+        print("[SYNC] User Updated: " .. packet.username)
+        
+    elseif packet.cmd == "REPLICATE_ZONE" then
+        database.setZone(packet.id, packet.name, packet.parent)
+        print("[SYNC] Zone Added: " .. packet.name .. " (Parent: " .. (packet.parent or "ROOT") .. ")")
+    end
+end
 
--- 1. Handle Access (READ ONLY - Can be done by anyone)
-local function handleAuth(id, msg)
-    if not msg.user or not msg.sig then return end
-    local userData = users[msg.user]
-    
-    if not userData then
-        network_utils.send(id, "PUBLIC", { granted = false, reason = "UNKNOWN" })
+-- === 2. LEADER WRITE HANDLER (From Minter) ===
+local function handleWrite(id, msg)
+    -- RAFT CHECK: Redirect if not Leader
+    if not consensus.isLeader() then 
+        local leader = consensus.getLeader()
+        network_utils.send(id, "MINT", { retry = true, leader = leader })
+        print("[MINT] Redirecting to Leader: " .. tostring(leader))
         return 
     end
     
-    -- Verify HMAC
-    local dataToSign = (msg.gate or "") .. tostring(msg.nonce)
-    local expectedSig = tacs_core.hmac(userData.masterKey, dataToSign)
-    
-    if expectedSig == msg.sig then
-        network_utils.send(id, "PUBLIC", { granted = true })
-        print("[AUTH] Allowed " .. msg.user)
-    else
-        network_utils.send(id, "PUBLIC", { granted = false })
-        print("[AUTH] Denied " .. msg.user)
-    end
-end
-
--- 2. Handle Minting (WRITE - Leader Only)
-local function handleMint(id, msg)
-    -- RAFT CHECK: Am I the Leader?
-    if not consensus.isLeader() then
-        local leader = consensus.getLeader()
-        -- Redirect Minter to the correct Leader
-        network_utils.send(id, "MINT", { retry = true, leader = leader })
-        print("[MINT] Redirecting to Leader: " .. tostring(leader))
-        return
-    end
-
-    -- I AM THE LEADER - PROCEED
+    -- Decrypt Payload
     local decrypted = tacs_core.decrypt(CLUSTER_KEY, msg.nonce, msg.payload)
     local req = textutils.unserialize(decrypted)
+    if not req then return end
     
-    if not req or req.cmd ~= "MINT_USER" then return end
-    
-    print("[LEADER] Minting User: " .. req.username)
-    
-    -- Generate Data
-    local newMasterKey = tacs_core.randomBytes(32)
-    local userEntry = {
-        masterKey = newMasterKey,
-        level = req.level or 1,
-        created = os.epoch and os.epoch("utc") or os.time()
-    }
-    
-    -- Update Local DB
-    users[req.username] = userEntry
-    database.saveUsers(users)
-    
-    -- REPLICATION: Broadcast update to Followers (The Swarm)
-    -- We use the Cluster Key directly here to secure the replication packet
-    local replPayload = textutils.serialize({
-        cmd = "REPLICATE_USER",
-        username = req.username,
-        data = userEntry
-    })
-    
-    local replNonce = os.epoch and os.epoch("utc") or os.time()
-    local encryptedRepl = tacs_core.encrypt(CLUSTER_KEY, replNonce, replPayload)
-    
-    network_utils.broadcast("CLUSTER", {
-        nonce = replNonce,
-        payload = encryptedRepl
-    })
-    print("[LEADER] Replication Sent.")
-    
-    -- Reply to Minter
-    local respPayload = textutils.serialize({
-        success = true,
-        masterKey = newMasterKey
-    })
-    local respNonce = os.epoch and os.epoch("utc") or os.time()
-    local encryptedResp = tacs_core.encrypt(CLUSTER_KEY, respNonce, respPayload)
-    
-    network_utils.send(id, "MINT", {
-        nonce = respNonce,
-        payload = encryptedResp
-    })
-end
-
--- 3. Handle Replication (Followers applying updates)
-local function handleClusterUpdate(id, msg)
-    -- Ignore our own broadcasts
-    if id == os.getComputerID() then return end
-    
-    -- Decrypt
-    local decrypted = tacs_core.decrypt(CLUSTER_KEY, msg.nonce, msg.payload)
-    local update = textutils.unserialize(decrypted)
-    
-    if not update then return end
-    
-    -- Apply Replication
-    if update.cmd == "REPLICATE_USER" then
-        print("[SYNC] User Update: " .. update.username .. " (via " .. id .. ")")
-        users[update.username] = update.data
-        database.saveUsers(users)
+    -- A) MINT USER
+    if req.cmd == "MINT_USER" then
+        print("[LEADER] Minting User: " .. req.username)
+        
+        local newKey = tacs_core.randomBytes(32)
+        local userEntry = {
+            masterKey = newKey,
+            level = req.level or 1,
+            meta = req.meta, -- { type="BLUE", perms={"NPP"} }
+            created = os.epoch("utc")
+        }
+        database.setUser(req.username, userEntry)
+        
+        -- Replicate to Swarm
+        local repl = textutils.serialize({ cmd="REPLICATE_USER", username=req.username, data=userEntry })
+        local nonce = os.epoch("utc")
+        local enc = tacs_core.encrypt(CLUSTER_KEY, nonce, repl)
+        network_utils.broadcast("CLUSTER", { nonce=nonce, payload=enc })
+        
+        -- Reply to Minter
+        local resp = textutils.serialize({ success=true, masterKey=newKey })
+        local encResp = tacs_core.encrypt(CLUSTER_KEY, nonce, resp)
+        network_utils.send(id, "MINT", { nonce=nonce, payload=encResp })
+        
+    -- B) ADD ZONE
+    elseif req.cmd == "ADD_ZONE" then
+        print("[LEADER] Adding Zone: " .. req.name)
+        
+        database.setZone(req.id, req.name, req.parent)
+        
+        -- Replicate
+        local repl = textutils.serialize({ cmd="REPLICATE_ZONE", id=req.id, name=req.name, parent=req.parent })
+        local nonce = os.epoch("utc")
+        local enc = tacs_core.encrypt(CLUSTER_KEY, nonce, repl)
+        network_utils.broadcast("CLUSTER", { nonce=nonce, payload=enc })
+        
+        -- Reply Success
+        local resp = textutils.serialize({ success=true, msg="Zone Added" })
+        local encResp = tacs_core.encrypt(CLUSTER_KEY, nonce, resp)
+        network_utils.send(id, "MINT", { nonce=nonce, payload=encResp })
     end
 end
 
--- === MAIN LOOPS ===
-
-local function publicListener()
-    while true do
-        local id, msg = network_utils.receive("PUBLIC", 9999)
-        if msg then handleAuth(id, msg) end
-    end
-end
+-- === LISTENERS ===
 
 local function minterListener()
     while true do
         local id, msg = network_utils.receive("MINT", 9999)
-        if msg then handleMint(id, msg) end
+        if msg then handleWrite(id, msg) end
     end
 end
 
--- Listens for Replication packets (REPLICATE_USER)
--- Note: Consensus packets (HEARTBEAT/VOTE) are handled by consensus.start
 local function clusterListener()
     while true do
         local id, msg = network_utils.receive("CLUSTER", 9999)
         if msg and msg.payload then
-            -- We just check if it's a replication packet inside
-            -- We have to decrypt to find out, but since consensus.lua also decrypts,
-            -- this is a trade-off for simplicity in parallel execution.
+            -- We interpret packet type. 
+            -- Consensus packets handled by consensus.start, we only want REPLICATE cmds
             local plain = tacs_core.decrypt(CLUSTER_KEY, msg.nonce, msg.payload)
             local packet = textutils.unserialize(plain)
-            
-            if packet and packet.cmd == "REPLICATE_USER" then
-                -- Re-package logically for the handler to keep code clean
-                handleClusterUpdate(id, msg)
+            if packet and (packet.cmd == "REPLICATE_USER" or packet.cmd == "REPLICATE_ZONE") then
+                handleReplication(id, packet)
             end
         end
     end
 end
 
--- Start Everything
-print("[*] Node Online. Starting Consensus Engine...")
+print("[*] Temelin Node Online (Management Mode).")
 parallel.waitForAll(
-    -- 1. Raft Engine (Handles Heartbeats, Elections, Dead Node Pruning)
-    consensus.start,
-    
-    -- 2. App Listeners
-    publicListener,
-    minterListener,
+    consensus.start, 
+    minterListener, 
     clusterListener
 )
