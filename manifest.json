@@ -1,5 +1,5 @@
 {
-  "version": 0.35,
+  "version": 0.36,
   "common": [
     "libs/tacs_core.lua",
     "libs/network_utils.lua"

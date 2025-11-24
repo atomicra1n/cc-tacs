@@ -1,6 +1,6 @@
--- TACS MINTER TERMINAL v8.0 (RAFT COMPATIBLE)
+-- TACS MINTER TERMINAL v8.1 (IDEMPOTENCY FIX)
 -- Role: Issue Secure Cards & Manage Zones
--- Update: Dynamic Nonce Regeneration for Replay Protection
+-- Update: Fixed Duplicate Logs via Request IDs
 
 os.loadAPI("libs/tacs_core.lua")
 os.loadAPI("libs/network_utils.lua")
@@ -9,7 +9,7 @@ local CLUSTER_KEY_FILE = ".cluster_key"
 local CLUSTER_KEY = nil
 
 -- ==========================================
--- 1. FOB FIRMWARE TEMPLATE (HEX SAFE + CEZ)
+-- 1. FOB FIRMWARE TEMPLATE
 -- ==========================================
 local FOB_TEMPLATE = [[
 -- TACS SECURE FOB (ID: %d)
@@ -159,6 +159,11 @@ end
 
 CLUSTER_KEY = loadClusterKey()
 
+local function genReqID()
+    -- Generates a unique ID for the ACTION, not the packet.
+    return tostring(getTime()) .. "-" .. tostring(math.random(10000,99999))
+end
+
 local function sendToLeader(payloadTable, specificTarget)
     if not CLUSTER_KEY then CLUSTER_KEY = loadClusterKey() end
     if not CLUSTER_KEY then 
@@ -174,7 +179,6 @@ local function sendToLeader(payloadTable, specificTarget)
     
     while attempts < 8 do
         -- REGENERATION: We must regenerate Nonce & Encryption on every try
-        -- Otherwise, if we retry after 10s, the server rejects us.
         local nonce = getTime()
         local encReq = tacs_core.encrypt(CLUSTER_KEY, nonce, textutils.serialize(payloadTable))
         
@@ -189,26 +193,24 @@ local function sendToLeader(payloadTable, specificTarget)
             network_utils.broadcast("MINT", { nonce = nonce, payload = encReq })
         end
         
-        local sender, msg = network_utils.receive("MINT", 1.5) -- Wait longer for Raft Consensus
+        local sender, msg = network_utils.receive("MINT", 1.5) 
         
         if msg then
             if msg.retry and msg.leader then
                 print("Redirected to Leader: " .. msg.leader)
                 target = msg.leader
-                -- Loop will retry immediately with new target AND FRESH NONCE
+                -- Loop will retry immediately with new target
             elseif msg.payload then
                 local dec = tacs_core.decrypt(CLUSTER_KEY, msg.nonce, msg.payload)
                 return textutils.unserialize(dec)
             end
         else
-            -- Timeout handling
             print("Timeout... Retrying")
-            target = nil -- Fallback to broadcast if specific target failed
+            target = nil 
         end
         
         attempts = attempts + 1
     end
-    
     return nil
 end
 
@@ -245,8 +247,13 @@ local function actionMint()
     if not tid then return end
     
     print("Requesting Mint from Hivemind...")
+    
+    -- Generate ID ONCE here
+    local rID = genReqID()
+    
     local resp = sendToLeader({ 
         cmd = "MINT_USER", 
+        reqID = rID, -- Pass ID
         username = username, 
         level = 1, 
         meta = { type = cType, perms = perms } 
@@ -258,7 +265,6 @@ local function actionMint()
         local hwKey = tacs_core.sha256(tostring(tid))
         local encMaster = tacs_core.encrypt(hwKey, bindIV, resp.masterKey)
         
-        -- HEX ENCODE
         local encHex = tacs_core.toHex(encMaster)
         
         local path = peripheral.find("drive").getMountPath()
@@ -288,7 +294,9 @@ local function actionAddZone()
     local parent = read()
     if parent == "" then parent = nil end
     
-    local resp = sendToLeader({ cmd = "ADD_ZONE", id = id, name = name, parent = parent })
+    local rID = genReqID()
+    local resp = sendToLeader({ cmd = "ADD_ZONE", reqID = rID, id = id, name = name, parent = parent })
+    
     if resp and resp.success then print("SUCCESS.") else print("FAILED.") end
     sleep(2)
 end
@@ -296,7 +304,7 @@ end
 local function actionListZones()
     term.clear(); term.setCursorPos(1,1)
     print("Fetching Zones...")
-    local resp = sendToLeader({ cmd = "LIST_ZONES" })
+    local resp = sendToLeader({ cmd = "LIST_ZONES" }) -- Reads don't need Dedup IDs usually
     
     term.clear(); term.setCursorPos(1,1)
     print("--- ZONES ---")
@@ -321,7 +329,9 @@ local function actionDeleteZone()
     local id = read()
     if id == "" then return end
     
-    local resp = sendToLeader({ cmd = "DELETE_ZONE", id = id })
+    local rID = genReqID()
+    local resp = sendToLeader({ cmd = "DELETE_ZONE", reqID = rID, id = id })
+    
     if resp and resp.success then print("SUCCESS.") else print("FAILED.") end
     sleep(2)
 end
