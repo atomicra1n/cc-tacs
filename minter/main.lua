@@ -86,7 +86,7 @@ local function drawUI(status)
     local y = 11
     cPrint(y, USERNAME)
     cPrint(y+1, "-----------------")
-    cPrint(y+2, "IK: " .. MY_ID)
+    cPrint(y+2, "Cislo IK: " .. MY_ID)
     cPrint(y+3, "-----------------")
     cPrint(y+4, "Jaderna elektrarna")
     cPrint(y+5, "Temelin")
