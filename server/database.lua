@@ -1,5 +1,5 @@
--- TACS DATABASE MANAGER v5.0 (SNAPSHOT READY)
--- Supports Full State Dump & Restore for new nodes
+-- TACS DATABASE MANAGER v7.0 (ENCRYPTED KEYS)
+-- Features: Device-Bound Key Storage
 
 os.loadAPI("libs/tacs_core.lua")
 
@@ -41,7 +41,7 @@ local function init()
         ZONES = textutils.unserializeJSON(f.readAll()) or {}
         f.close()
     else
-        ZONES["ETE"] = { name="Elektrarna Temelin", parent=nil }
+        ZONES["NPP"] = { name="Temelin NPP", parent=nil }
     end
 end
 init()
@@ -53,34 +53,27 @@ local function save(file, data)
     f.close()
 end
 
--- === SNAPSHOT API (NEW) ===
+-- === SNAPSHOT API ===
 function isEmpty()
     local uCount = 0
     for _ in pairs(USERS) do uCount = uCount + 1 end
-    -- If only default zone exists and no users, we consider it empty/fresh
     return uCount == 0
 end
 
 function dumpState()
-    return {
-        users = USERS,
-        zones = ZONES
-    }
+    return { users = USERS, zones = ZONES }
 end
 
 function restoreState(dumpData)
     if not dumpData then return false end
-    
     if dumpData.users then
         USERS = dumpData.users
         save(DB_FILE, USERS)
     end
-    
     if dumpData.zones then
         ZONES = dumpData.zones
         save(ZONES_FILE, ZONES)
     end
-    
     return true
 end
 
@@ -97,6 +90,12 @@ function getZone(id) return ZONES[id] end
 function setZone(id, name, parent)
     ZONES[id] = { name=name, parent=parent }
     save(ZONES_FILE, ZONES)
+end
+function deleteZone(id)
+    if ZONES[id] then
+        ZONES[id] = nil
+        save(ZONES_FILE, ZONES)
+    end
 end
 function getAllZones() return ZONES end
 function getParent(zoneID) 
@@ -172,22 +171,48 @@ function getNodeCount()
     return count
 end
 
--- === KEY API ===
+-- === KEY API (ENCRYPTED) ===
+
+local function getDeviceKey()
+    return tacs_core.sha256(tostring(os.getComputerID()))
+end
+
+function saveKey(rawKey)
+    local hwKey = getDeviceKey()
+    local iv = os.epoch and os.epoch("utc") or os.time()
+    local encrypted = tacs_core.encrypt(hwKey, iv, rawKey)
+    
+    local f = fs.open(KEY_FILE, "w")
+    f.write(textutils.serialize({ iv = iv, key = encrypted }))
+    f.close()
+end
+
 function getKey()
     if fs.exists(KEY_FILE) then
         local f = fs.open(KEY_FILE, "r")
-        local k = f.readAll()
+        local content = f.readAll()
         f.close()
-        return k
+        
+        -- Try to deserialize (New format)
+        local data = textutils.unserialize(content)
+        if type(data) == "table" and data.iv and data.key then
+            -- Decrypt
+            local hwKey = getDeviceKey()
+            return tacs_core.decrypt(hwKey, data.iv, data.key)
+        else
+            -- Fallback for legacy plaintext (auto-migrate)
+            print("[DB] Migrating Key to Encrypted Format...")
+            saveKey(content)
+            return content 
+        end
     end
     return nil
 end
+
 function genKey()
     if fs.exists(KEY_FILE) then return getKey() end
     print("GENESIS: Generating new Cluster Key...")
     local key = tacs_core.randomBytes(32)
-    local f = fs.open(KEY_FILE, "w")
-    f.write(key)
-    f.close()
+    saveKey(key)
     return key
 end
