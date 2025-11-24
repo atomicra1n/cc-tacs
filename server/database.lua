@@ -41,7 +41,7 @@ local function init()
         ZONES = textutils.unserializeJSON(f.readAll()) or {}
         f.close()
     else
-        ZONES["NPP"] = { name="Temelin NPP", parent=nil }
+        ZONES["ETE"] = { name="Elektrarna Temelin", parent=nil }
     end
 end
 init()
