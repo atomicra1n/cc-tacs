@@ -1,5 +1,5 @@
--- TACS MINTER TERMINAL v6.0 (ROBUST NETWORKING)
--- Fixed: Race conditions with redirects and deduplication
+-- TACS MINTER TERMINAL v6.1 (BUGFIX)
+-- Fixed: SendToLeader retry loop channel error
 
 os.loadAPI("libs/tacs_core.lua")
 os.loadAPI("libs/network_utils.lua")
@@ -90,7 +90,7 @@ end
 
 CLUSTER_KEY = loadClusterKey()
 
--- [FIXED] Robust Sender
+-- [FIXED] Robust Sender Logic
 local function sendToLeader(payloadTable)
     if not CLUSTER_KEY then CLUSTER_KEY = loadClusterKey() end
     if not CLUSTER_KEY then 
@@ -104,94 +104,57 @@ local function sendToLeader(payloadTable)
     local nonce = os.epoch("utc")
     local encReq = tacs_core.encrypt(CLUSTER_KEY, nonce, textutils.serialize(payloadTable))
     
-    -- 1. Initial Discovery Broadcast
-    -- We clear queue first to ensure fresh response
-    while os.pullEventRaw("modem_message") == "modem_message" do end -- Drain (non-blocking check logic needed actually)
-    -- CC doesn't have easy non-blocking peek, so we just rely on loop filtering below.
+    -- 1. Initial Discovery Phase (Broadcast)
+    -- Drain any old events first
+    while os.pullEventRaw("modem_message") == "modem_message" do end 
     
     network_utils.broadcast("MINT", { nonce = nonce, payload = encReq })
     print("Contacting Hivemind...")
     
-    local timer = os.startTimer(3)
     local leaderID = nil
     
-    -- LOOP 1: Discovery Phase
-    -- Listen for EITHER a Success (if Leader heard us) OR a Redirect
-    while true do
-        local e, p1, p2, p3 = os.pullEvent()
-        if e == "timer" and p1 == timer then
-            break -- Timeout
-        elseif e == "modem_message" then
-            -- Check protocol manually since network_utils.receive eats events
-            -- p3 is channel, p4 is replyChan, p5 is msg
-            -- Wait, os.pullEvent returns different args.
-            -- event, side, senderChannel, replyChannel, message, distance
-            local msg = p3 -- Using network_utils abstraction is safer usually, but we need control.
-            -- Let's stick to network_utils.receive logic but wrapped in a loop
-        end
-    end
-    
-    -- Re-implementing receive loop using network_utils to keep it simple but robust
+    -- Try to get a response (Success or Redirect)
     local attempts = 0
-    while attempts < 10 do
-        local sender, msg = network_utils.receive("MINT", 1) -- Short timeout to cycle fast
-        
+    while attempts < 8 do
+        local sender, msg = network_utils.receive("MINT", 0.5)
         if msg then
-            -- CASE A: Redirection
+            -- CASE A: Redirection (We hit a Follower)
             if msg.retry and msg.leader then
                 leaderID = msg.leader
-                -- STOP LISTENING to others. We found the Leader ID.
                 break 
             end
             
-            -- CASE B: Direct Success (Leader heard broadcast)
+            -- CASE B: Direct Success (We hit the Leader)
             if msg.payload then
                 local dec = tacs_core.decrypt(CLUSTER_KEY, msg.nonce, msg.payload)
-                local resp = textutils.unserialize(dec)
-                if resp then return resp end -- Success!
+                return textutils.unserialize(dec)
             end
-        else
-            attempts = attempts + 1
         end
+        attempts = attempts + 1
     end
     
-    -- 2. Directed Phase (If we found a Leader ID)
+    -- 2. Directed Phase (If Redirected)
     if leaderID then
-        print("Leader identified: " .. leaderID)
+        print("Redirected to Leader: " .. leaderID)
         
-        -- RE-GENERATE NONCE (Fixes Server Dedup ignoring us)
+        -- RE-GENERATE NONCE (Prevent Deduplication Reject)
         nonce = os.epoch("utc")
         encReq = tacs_core.encrypt(CLUSTER_KEY, nonce, textutils.serialize(payloadTable))
         
+        -- Send directly to Leader
         network_utils.send(leaderID, "MINT", { nonce = nonce, payload = encReq })
         
-        -- Wait for SPECIFIC reply from Leader
-        local retryTimer = os.startTimer(4)
-        while true do
-            local e, side, sChan, rChan, msg, dist = os.pullEvent()
-            if e == "timer" and side == retryTimer then
-                print("Leader timed out.")
-                return nil
-            elseif e == "modem_message" and sChan == 666 and type(msg) == "table" then -- 666 isn't mint chan
-                -- We need to check if it matches MINT protocol
-                -- Assuming network_utils opens specific channels. 
-                -- Let's blindly trust network_utils.receive but verify Sender ID
-                
-                -- Actually, let's just use network_utils receive loop
-            end
-        end
-    end
-    
-    -- CLEAN IMPLEMENTATION OF PHASE 2
-    if leaderID then
-        -- Loop to drain queue of old redirects and find the real payload
-        for i=1, 20 do
-            local sender, msg = network_utils.receive("MINT", 0.2)
+        -- Listen for reply specifically from Leader
+        for i=1, 10 do
+            local sender, msg = network_utils.receive("MINT", 0.5)
             if sender == leaderID and msg and msg.payload then
                 local dec = tacs_core.decrypt(CLUSTER_KEY, msg.nonce, msg.payload)
                 return textutils.unserialize(dec)
             end
         end
+        print("Leader did not reply.")
+    else
+        print("No response from cluster.")
     end
     
     return nil
@@ -242,7 +205,7 @@ local function actionMint()
         while peripheral.find("drive").isDiskPresent() do sleep(0.5) end
     else
         print("FAILED.")
-        if resp and resp.msg then print(resp.msg) end -- Error info
+        if resp and resp.msg then print(resp.msg) end 
         sleep(2)
     end
 end
