@@ -1,5 +1,5 @@
 {
-  "version": 0.17,
+  "version": 0.18,
   "common": [
     "libs/tacs_core.lua",
     "libs/network_utils.lua"
@@ -8,7 +8,8 @@
     "server": [
       "server/database.lua",
       "server/main.lua",
-      "server/consensus.lua"
+      "server/consensus.lua",
+      "server/integrity.lua"
     ],
     "turnstile": [
       "turnstile/main.lua",
