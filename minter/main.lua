@@ -1,7 +1,7 @@
--- TACS MINTER TERMINAL v7.0 (CEZ UI)
+-- TACS MINTER TERMINAL v7.1 (CEZ FIX)
 -- Role: Issue Secure Cards & Manage Zones
--- Fixed: Template argument alignment bug
--- Added: Custom ASCII Art UI for Pocket Computers
+-- Fixed: Removed blocking event loop causing hang
+-- Updated: UI Text to match Temelin spec
 
 os.loadAPI("libs/tacs_core.lua")
 os.loadAPI("libs/network_utils.lua")
@@ -70,8 +70,7 @@ local function drawUI(status)
         term.write(text)
     end
 
-    -- CEZ ASCII ART (Miniaturized for Pocket PC 26x20)
-    -- Original was too tall (9 lines), condensed to 6 lines
+    -- CEZ ASCII ART (Condensed)
     local logoY = 2
     term.setCursorPos(2, logoY);   term.write("#################")
     term.setCursorPos(2, logoY+1); term.write("#")
@@ -83,13 +82,15 @@ local function drawUI(status)
     term.setCursorPos(2, logoY+7); term.write("#")
     term.setCursorPos(2, logoY+8); term.write("#################")
 
-    local y = 9
+    local y = 11
     cPrint(y, USERNAME)
     cPrint(y+1, "-----------------")
-    cPrint(y+2, "Číslo IK: " .. MY_ID)
+    cPrint(y+2, "IK: " .. MY_ID)
     cPrint(y+3, "-----------------")
-    cPrint(y+4, "JE Temelín")
-    cPrint(y+5, "-----------------")
+    -- Split long text to ensure fit on Pocket Computer
+    cPrint(y+4, "Jaderna elektrarna")
+    cPrint(y+5, "Temelin")
+    cPrint(y+6, "-----------------")
     
     -- Role / Status
     if status then
@@ -158,7 +159,7 @@ end
 
 CLUSTER_KEY = loadClusterKey()
 
--- Robust Sender
+-- [FIXED] Robust Sender (Non-Blocking)
 local function sendToLeader(payloadTable)
     if not CLUSTER_KEY then CLUSTER_KEY = loadClusterKey() end
     if not CLUSTER_KEY then 
@@ -172,7 +173,7 @@ local function sendToLeader(payloadTable)
     local nonce = os.epoch("utc")
     local encReq = tacs_core.encrypt(CLUSTER_KEY, nonce, textutils.serialize(payloadTable))
     
-    while os.pullEventRaw("modem_message") == "modem_message" do end 
+    -- Removed blocking 'while os.pullEventRaw' loop here
     
     network_utils.broadcast("MINT", { nonce = nonce, payload = encReq })
     print("Contacting Hivemind...")
