@@ -1,5 +1,6 @@
--- TACS SERVER NODE (HIVEMIND) v7.0 (FULL SYNC)
--- Features: Consensus, Management, Replication, & STATE SNAPSHOTTING
+-- TACS SERVER NODE (HIVEMIND) v7.2 (SECURE GENESIS)
+-- Features: Consensus, Management, Replication, Snapshotting
+-- Security: Encrypted Key Storage
 
 os.loadAPI("libs/tacs_core.lua")
 os.loadAPI("libs/network_utils.lua")
@@ -7,6 +8,7 @@ os.loadAPI("server/database.lua")
 os.loadAPI("server/consensus.lua")
 
 local CLUSTER_KEY = database.getKey()
+local PROCESSED_NONCES = {} 
 
 -- === INIT ===
 term.clear()
@@ -29,6 +31,7 @@ if not CLUSTER_KEY then
         end
         local path = drive.getMountPath()
         local f = fs.open(fs.combine(path, ".cluster_key"), "w")
+        -- Disk always gets Plaintext key so it can be moved
         f.write(key)
         f.close()
         term.setTextColor(colors.lime)
@@ -51,12 +54,15 @@ if not CLUSTER_KEY then
                     local f = fs.open(keyPath, "r")
                     local k = f.readAll()
                     f.close()
-                    local localF = fs.open(".cluster_key", "w")
-                    localF.write(k)
-                    localF.close()
+                    
+                    -- Save to local system using SECURE SAVE
+                    database.saveKey(k)
                     CLUSTER_KEY = k
-                    print("Key loaded! Rebooting...")
-                    sleep(1); os.reboot()
+                    
+                    term.setTextColor(colors.lime)
+                    print("[OK] Key Encrypted & Loaded! Rebooting...")
+                    term.setTextColor(colors.white)
+                    sleep(2); os.reboot()
                 end
              end
              if not CLUSTER_KEY then
@@ -69,10 +75,21 @@ else
     print("[+] Cluster Key Loaded.")
 end
 
+-- === UTILS ===
+local function checkDedup(nonce)
+    local now = os.epoch and os.epoch("utc") or os.time()
+    for n, t in pairs(PROCESSED_NONCES) do
+        if now - t > 10000 then PROCESSED_NONCES[n] = nil end
+    end
+    
+    if PROCESSED_NONCES[nonce] then return true end
+    PROCESSED_NONCES[nonce] = now
+    return false
+end
+
 -- === SYNC REQUESTER ===
--- Run once on startup. If we are empty, ask for data.
 local function initialSync()
-    sleep(3) -- Wait for Raft to stabilize/find leader
+    sleep(3) 
     if database.isEmpty() and not consensus.isLeader() then
         print("[SYNC] Database empty. Requesting Snapshot...")
         local nonce = os.epoch("utc")
@@ -84,7 +101,6 @@ end
 
 -- === 1. REPLICATION & SYNC HANDLER ===
 local function handleClusterMsg(id, packet)
-    -- A) INCREMENTAL UPDATES
     if packet.cmd == "REPLICATE_USER" then
         database.setUser(packet.username, packet.data)
         print("[SYNC] User Updated: " .. packet.username)
@@ -92,8 +108,11 @@ local function handleClusterMsg(id, packet)
     elseif packet.cmd == "REPLICATE_ZONE" then
         database.setZone(packet.id, packet.name, packet.parent)
         print("[SYNC] Zone Added: " .. packet.name)
+        
+    elseif packet.cmd == "REPLICATE_DEL_ZONE" then
+        database.deleteZone(packet.id)
+        print("[SYNC] Zone Deleted: " .. packet.id)
     
-    -- B) FULL SYNC RESPONSE (Receiver)
     elseif packet.cmd == "FULL_SYNC" then
         if packet.target == os.getComputerID() then
             print("[SYNC] Receiving Full Snapshot...")
@@ -104,22 +123,13 @@ local function handleClusterMsg(id, packet)
             end
         end
         
-    -- C) SYNC REQUEST (Leader)
     elseif packet.cmd == "REQUEST_SYNC" then
         if consensus.isLeader() then
             print("[LEADER] Sending Snapshot to Node " .. packet.id)
             local dump = database.dumpState()
-            
-            local resp = textutils.serialize({ 
-                cmd = "FULL_SYNC", 
-                target = packet.id, 
-                data = dump 
-            })
-            
+            local resp = textutils.serialize({ cmd = "FULL_SYNC", target = packet.id, data = dump })
             local nonce = os.epoch("utc")
             local enc = tacs_core.encrypt(CLUSTER_KEY, nonce, resp)
-            -- Broadcast so everyone sees it? Or send direct. 
-            -- Send direct is cleaner but broadcast ensures reachability.
             network_utils.send(packet.id, "CLUSTER", { nonce = nonce, payload = enc })
         end
     end
@@ -133,9 +143,13 @@ local function handleWrite(id, msg)
         return 
     end
     
+    if checkDedup(msg.nonce) then return end
+    
     local decrypted = tacs_core.decrypt(CLUSTER_KEY, msg.nonce, msg.payload)
     local req = textutils.unserialize(decrypted)
     if not req then return end
+    
+    local nonce = os.epoch("utc")
     
     if req.cmd == "MINT_USER" then
         print("[LEADER] Minting User: " .. req.username)
@@ -144,17 +158,14 @@ local function handleWrite(id, msg)
             masterKey = newKey,
             level = req.level or 1,
             meta = req.meta,
-            created = os.epoch("utc")
+            created = nonce
         }
         database.setUser(req.username, userEntry)
         
-        -- Replicate
         local repl = textutils.serialize({ cmd="REPLICATE_USER", username=req.username, data=userEntry })
-        local nonce = os.epoch("utc")
         local enc = tacs_core.encrypt(CLUSTER_KEY, nonce, repl)
         network_utils.broadcast("CLUSTER", { nonce=nonce, payload=enc })
         
-        -- Reply
         local resp = textutils.serialize({ success=true, masterKey=newKey })
         local encResp = tacs_core.encrypt(CLUSTER_KEY, nonce, resp)
         network_utils.send(id, "MINT", { nonce=nonce, payload=encResp })
@@ -163,14 +174,29 @@ local function handleWrite(id, msg)
         print("[LEADER] Adding Zone: " .. req.name)
         database.setZone(req.id, req.name, req.parent)
         
-        -- Replicate
         local repl = textutils.serialize({ cmd="REPLICATE_ZONE", id=req.id, name=req.name, parent=req.parent })
-        local nonce = os.epoch("utc")
         local enc = tacs_core.encrypt(CLUSTER_KEY, nonce, repl)
         network_utils.broadcast("CLUSTER", { nonce=nonce, payload=enc })
         
-        -- Reply
         local resp = textutils.serialize({ success=true, msg="Zone Added" })
+        local encResp = tacs_core.encrypt(CLUSTER_KEY, nonce, resp)
+        network_utils.send(id, "MINT", { nonce=nonce, payload=encResp })
+        
+    elseif req.cmd == "LIST_ZONES" then
+        local zones = database.getAllZones()
+        local resp = textutils.serialize({ success=true, zones=zones })
+        local encResp = tacs_core.encrypt(CLUSTER_KEY, nonce, resp)
+        network_utils.send(id, "MINT", { nonce=nonce, payload=encResp })
+        
+    elseif req.cmd == "DELETE_ZONE" then
+        print("[LEADER] Deleting Zone: " .. req.id)
+        database.deleteZone(req.id)
+        
+        local repl = textutils.serialize({ cmd="REPLICATE_DEL_ZONE", id=req.id })
+        local enc = tacs_core.encrypt(CLUSTER_KEY, nonce, repl)
+        network_utils.broadcast("CLUSTER", { nonce=nonce, payload=enc })
+        
+        local resp = textutils.serialize({ success=true })
         local encResp = tacs_core.encrypt(CLUSTER_KEY, nonce, resp)
         network_utils.send(id, "MINT", { nonce=nonce, payload=encResp })
     end
@@ -191,8 +217,7 @@ local function clusterListener()
         if msg and msg.payload then
             local plain = tacs_core.decrypt(CLUSTER_KEY, msg.nonce, msg.payload)
             local packet = textutils.unserialize(plain)
-            -- Filter only replication/sync messages
-            if packet and (packet.cmd == "REPLICATE_USER" or packet.cmd == "REPLICATE_ZONE" or packet.cmd == "REQUEST_SYNC" or packet.cmd == "FULL_SYNC") then
+            if packet and (packet.cmd == "REPLICATE_USER" or packet.cmd == "REPLICATE_ZONE" or packet.cmd == "REPLICATE_DEL_ZONE" or packet.cmd == "REQUEST_SYNC" or packet.cmd == "FULL_SYNC") then
                 handleClusterMsg(id, packet)
             end
         end
@@ -201,7 +226,6 @@ end
 
 print("[*] Temelin Node Online (Management Mode).")
 
--- Launch Sync Check in parallel
 parallel.waitForAll(
     consensus.start, 
     minterListener, 
