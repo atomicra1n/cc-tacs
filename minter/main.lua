@@ -1,5 +1,6 @@
--- TACS MINTER TERMINAL v6.1 (BUGFIX)
--- Fixed: SendToLeader retry loop channel error
+-- TACS MINTER TERMINAL v6.2 (NON-BLOCKING FIX)
+-- Fixed: Removed blocking event loop causing hang on empty queue
+-- Added: Verbose Debugging
 
 os.loadAPI("libs/tacs_core.lua")
 os.loadAPI("libs/network_utils.lua")
@@ -90,7 +91,7 @@ end
 
 CLUSTER_KEY = loadClusterKey()
 
--- [FIXED] Robust Sender Logic
+-- [FIXED] Robust Sender Logic without Blocking
 local function sendToLeader(payloadTable)
     if not CLUSTER_KEY then CLUSTER_KEY = loadClusterKey() end
     if not CLUSTER_KEY then 
@@ -104,16 +105,13 @@ local function sendToLeader(payloadTable)
     local nonce = os.epoch("utc")
     local encReq = tacs_core.encrypt(CLUSTER_KEY, nonce, textutils.serialize(payloadTable))
     
-    -- 1. Initial Discovery Phase (Broadcast)
-    -- Drain any old events first
-    while os.pullEventRaw("modem_message") == "modem_message" do end 
-    
+    print("[DEBUG] Broadcasting Request...")
     network_utils.broadcast("MINT", { nonce = nonce, payload = encReq })
-    print("Contacting Hivemind...")
     
     local leaderID = nil
     
     -- Try to get a response (Success or Redirect)
+    print("[DEBUG] Listening for Swarm...")
     local attempts = 0
     while attempts < 8 do
         local sender, msg = network_utils.receive("MINT", 0.5)
@@ -121,11 +119,13 @@ local function sendToLeader(payloadTable)
             -- CASE A: Redirection (We hit a Follower)
             if msg.retry and msg.leader then
                 leaderID = msg.leader
+                print("[DEBUG] Redirect received -> Node " .. leaderID)
                 break 
             end
             
             -- CASE B: Direct Success (We hit the Leader)
             if msg.payload then
+                print("[DEBUG] Direct Reply received from " .. sender)
                 local dec = tacs_core.decrypt(CLUSTER_KEY, msg.nonce, msg.payload)
                 return textutils.unserialize(dec)
             end
@@ -135,7 +135,7 @@ local function sendToLeader(payloadTable)
     
     -- 2. Directed Phase (If Redirected)
     if leaderID then
-        print("Redirected to Leader: " .. leaderID)
+        print("[DEBUG] Contacting Leader " .. leaderID .. "...")
         
         -- RE-GENERATE NONCE (Prevent Deduplication Reject)
         nonce = os.epoch("utc")
@@ -148,13 +148,14 @@ local function sendToLeader(payloadTable)
         for i=1, 10 do
             local sender, msg = network_utils.receive("MINT", 0.5)
             if sender == leaderID and msg and msg.payload then
+                print("[DEBUG] Leader Replied.")
                 local dec = tacs_core.decrypt(CLUSTER_KEY, msg.nonce, msg.payload)
                 return textutils.unserialize(dec)
             end
         end
-        print("Leader did not reply.")
+        print("[ERROR] Leader " .. leaderID .. " did not reply.")
     else
-        print("No response from cluster.")
+        print("[ERROR] No response from cluster.")
     end
     
     return nil
@@ -188,7 +189,7 @@ local function actionMint()
     write("ID: ")
     local tid = tonumber(read())
     if not tid then return end
-    print("Requesting Key...")
+    
     local resp = sendToLeader({ cmd = "MINT_USER", username = username, level = 1, meta = { type = cType, perms = perms } })
     if resp and resp.success then
         print("Burning...")
@@ -235,9 +236,12 @@ local function actionListZones()
     term.clear(); term.setCursorPos(1,1)
     print("--- ZONES ---")
     if resp and resp.zones then
+        local count = 0
         for id, data in pairs(resp.zones) do
             print(string.format("[%s] %s (Parent: %s)", id, data.name, data.parent or "ROOT"))
+            count = count + 1
         end
+        if count == 0 then print("(No zones defined)") end
     else
         print("Failed to fetch or Empty.")
     end
