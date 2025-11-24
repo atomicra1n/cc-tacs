@@ -5,7 +5,6 @@
 os.loadAPI("libs/tacs_core.lua")
 os.loadAPI("libs/network_utils.lua")
 os.loadAPI("server/database.lua")
-os.loadAPI("server/consensus.lua")
 
 local CLUSTER_KEY = database.getKey()
 local PROCESSED_NONCES = {} 
@@ -74,6 +73,8 @@ if not CLUSTER_KEY then
 else
     print("[+] Cluster Key Loaded.")
 end
+
+os.loadAPI("server/consensus.lua")
 
 -- === UTILS ===
 local function checkDedup(nonce)
